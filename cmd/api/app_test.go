@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +16,7 @@ import (
 	_ "github.com/mattn/go-sqlite3" // CGo-based SQLite driver
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maglev.onebusaway.org/internal/app"
 	"maglev.onebusaway.org/internal/appconf"
 	"maglev.onebusaway.org/internal/gtfs"
 )
@@ -499,4 +504,122 @@ func TestBuildApplicationWithConfigFile(t *testing.T) {
 		assert.Equal(t, []string{"test-key"}, coreApp.Config.ApiKeys)
 		assert.Equal(t, 50, coreApp.Config.RateLimit)
 	})
+}
+
+func TestRun_GracefulShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	coreApp := &app.Application{}
+
+	srv := &http.Server{
+		Addr: "127.0.0.1:0",
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- Run(ctx, srv, coreApp, nil, logger)
+	}()
+
+	// Small delay so ListenAndServe starts
+	time.Sleep(120 * time.Millisecond)
+
+	// Trigger graceful shutdown
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server did not shut down in time")
+	}
+}
+
+func TestDumpConfigJSON_WithExampleFile(t *testing.T) {
+
+	// Load configuration from JSON file
+	jsonConfig, err := appconf.LoadFromFile("../../config.example.json")
+	if err != nil {
+		logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+		logger.Error("failed to load config file", "error", err)
+		os.Exit(1)
+	}
+
+	// Convert to app config
+	cfg := jsonConfig.ToAppConfig()
+
+	// Convert to GTFS config
+	gtfsCfgData := jsonConfig.ToGtfsConfigData()
+	gtfsCfg := gtfs.Config{
+		GtfsURL:                 gtfsCfgData.GtfsURL,
+		StaticAuthHeaderKey:     gtfsCfgData.StaticAuthHeaderKey,
+		StaticAuthHeaderValue:   gtfsCfgData.StaticAuthHeaderValue,
+		TripUpdatesURL:          gtfsCfgData.TripUpdatesURL,
+		VehiclePositionsURL:     gtfsCfgData.VehiclePositionsURL,
+		ServiceAlertsURL:        gtfsCfgData.ServiceAlertsURL,
+		RealTimeAuthHeaderKey:   gtfsCfgData.RealTimeAuthHeaderKey,
+		RealTimeAuthHeaderValue: gtfsCfgData.RealTimeAuthHeaderValue,
+		GTFSDataPath:            gtfsCfgData.GTFSDataPath,
+		Env:                     gtfsCfgData.Env,
+		Verbose:                 gtfsCfgData.Verbose,
+		EnableGTFSTidy:          gtfsCfgData.EnableGTFSTidy,
+	}
+
+	// Make a pipe to capture stdout
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	dumpConfigJSON(cfg, gtfsCfg)
+
+	_ = w.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+
+	output := buf.String()
+
+	// Parse and validate json
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, output)
+	}
+
+
+	if parsed["port"].(float64) != 4000 {
+		t.Fatalf("expected port 4000")
+	}
+
+	if parsed["env"].(string) != "development" {
+		t.Fatalf("expected env development")
+	}
+
+	staticFeed := parsed["gtfs-static-feed"].(map[string]interface{})
+
+	if staticFeed["url"] != "https://www.soundtransit.org/GTFS-rail/40_gtfs.zip" {
+		t.Fatalf("static feed URL mismatch")
+	}
+
+	feeds := parsed["gtfs-rt-feeds"].([]interface{})
+	if len(feeds) != 1 {
+		t.Fatalf("expected one realtime feed")
+	}
+
+	rtFeed := feeds[0].(map[string]interface{})
+
+	if rtFeed["trip-updates-url"] == "" {
+		t.Fatalf("trip-updates-url should not be empty")
+	}
+
+	if parsed["data-path"] != "./gtfs.db" {
+		t.Fatalf("data-path mismatch")
+	}
 }

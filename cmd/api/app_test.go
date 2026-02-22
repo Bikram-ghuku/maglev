@@ -534,23 +534,17 @@ func TestRun_GracefulShutdown(t *testing.T) {
 
 	select {
 	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("Run returned error: %v", err)
-		}
+		require.NoError(t, err, "Run returned error on graceful shutdown")
 	case <-time.After(3 * time.Second):
-		t.Fatal("server did not shut down in time")
+		assert.Fail(t, "server did not shut down in time")
 	}
 }
 
 func TestDumpConfigJSON_WithExampleFile(t *testing.T) {
-
 	// Load configuration from JSON file
 	jsonConfig, err := appconf.LoadFromFile("../../config.example.json")
-	if err != nil {
-		logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-		logger.Error("failed to load config file", "error", err)
-		os.Exit(1)
-	}
+
+	require.NoError(t, err, "failed to load config.example.json")
 
 	// Convert to app config
 	cfg := jsonConfig.ToAppConfig()
@@ -574,7 +568,9 @@ func TestDumpConfigJSON_WithExampleFile(t *testing.T) {
 
 	// Make a pipe to capture stdout
 	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
+	defer func() { os.Stdout = oldStdout }()
+	r, w, err := os.Pipe()
+	require.NoError(t, err, "Failed to create OS Pipe")
 	os.Stdout = w
 
 	dumpConfigJSON(cfg, gtfsCfg)
@@ -589,37 +585,21 @@ func TestDumpConfigJSON_WithExampleFile(t *testing.T) {
 
 	// Parse and validate json
 	var parsed map[string]interface{}
-	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
-		t.Fatalf("output is not valid JSON: %v\n%s", err, output)
-	}
+	
+	err = json.Unmarshal([]byte(output), &parsed)
+	require.NoError(t, err, "Output is not a valid JSON")
 
-
-	if parsed["port"].(float64) != 4000 {
-		t.Fatalf("expected port 4000")
-	}
-
-	if parsed["env"].(string) != "development" {
-		t.Fatalf("expected env development")
-	}
+	assert.Equal(t, float64(cfg.Port), parsed["port"])
+	assert.Equal(t, "development", parsed["env"])
 
 	staticFeed := parsed["gtfs-static-feed"].(map[string]interface{})
-
-	if staticFeed["url"] != "https://www.soundtransit.org/GTFS-rail/40_gtfs.zip" {
-		t.Fatalf("static feed URL mismatch")
-	}
+	assert.Equal(t, gtfsCfg.GtfsURL, staticFeed["url"])
 
 	feeds := parsed["gtfs-rt-feeds"].([]interface{})
-	if len(feeds) != 1 {
-		t.Fatalf("expected one realtime feed")
-	}
+	assert.Equal(t, 1, len(feeds))
 
 	rtFeed := feeds[0].(map[string]interface{})
 
-	if rtFeed["trip-updates-url"] == "" {
-		t.Fatalf("trip-updates-url should not be empty")
-	}
-
-	if parsed["data-path"] != "./gtfs.db" {
-		t.Fatalf("data-path mismatch")
-	}
+	assert.NotEqual(t, "", rtFeed["trip-updates-url"])
+	assert.Equal(t, gtfsCfg.GTFSDataPath , parsed["data-path"])
 }

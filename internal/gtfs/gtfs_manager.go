@@ -240,6 +240,10 @@ func (manager *Manager) GetStopsForLocation(
 	dbStops := queryStopsInBounds(manager.stopSpatialIndex, bounds)
 
 	for _, dbStop := range dbStops {
+		if ctx.Err() != nil {
+			return []gtfsdb.Stop{}
+		}
+
 		if query != "" && !isForRoutes {
 			if dbStop.Code.Valid && dbStop.Code.String == query {
 				return []gtfsdb.Stop{dbStop}
@@ -268,6 +272,10 @@ func (manager *Manager) GetStopsForLocation(
 
 				filteredCandidates := make([]stopWithDistance, 0, len(candidates))
 				for _, candidate := range candidates {
+					if ctx.Err() != nil {
+						return []gtfsdb.Stop{}
+					}
+
 					types := stopRouteTypes[candidate.stop.ID]
 					hasMatchingType := false
 					for _, rt := range types {
@@ -320,6 +328,10 @@ func (manager *Manager) GetStopsForLocation(
 
 					filteredCandidates := make([]stopWithDistance, 0, len(candidates))
 					for _, candidate := range candidates {
+						if ctx.Err() != nil {
+							return []gtfsdb.Stop{}
+						}
+
 						if stopsWithService[candidate.stop.ID] {
 							filteredCandidates = append(filteredCandidates, candidate)
 						}
@@ -541,4 +553,20 @@ func (manager *Manager) MarkUnhealthy() {
 	manager.staticMutex.Lock()
 	defer manager.staticMutex.Unlock()
 	manager.isHealthy = false
+}
+
+// SetRealTimeTripsForTest manually sets realtime trips for testing purposes.
+// This allows injecting mock data into the private realTimeTrips slice.
+func (manager *Manager) SetRealTimeTripsForTest(trips []gtfs.Trip) {
+	manager.realTimeMutex.Lock()
+	defer manager.realTimeMutex.Unlock()
+
+	manager.realTimeTrips = trips
+	manager.realTimeTripLookup = make(map[string]int)
+
+	for i, trip := range trips {
+		if trip.ID.ID != "" {
+			manager.realTimeTripLookup[trip.ID.ID] = i
+		}
+	}
 }

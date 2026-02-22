@@ -82,24 +82,9 @@ func (api *RestAPI) parseTripIdDetailsParams(r *http.Request) (TripDetailsParams
 }
 
 func (api *RestAPI) tripDetailsHandler(w http.ResponseWriter, r *http.Request) {
-	queryParamID := utils.ExtractIDFromParams(r)
-
-	if err := utils.ValidateID(queryParamID); err != nil {
-		fieldErrors := map[string][]string{
-			"id": {err.Error()},
-		}
-		api.validationErrorResponse(w, r, fieldErrors)
-		return
-	}
-
-	agencyID, tripID, err := utils.ExtractAgencyIDAndCodeID(queryParamID)
-	if err != nil {
-		fieldErrors := map[string][]string{
-			"id": {err.Error()},
-		}
-		api.validationErrorResponse(w, r, fieldErrors)
-		return
-	}
+	parsed, _ := utils.GetParsedIDFromContext(r.Context())
+	agencyID := parsed.AgencyID
+	tripID := parsed.CodeID
 
 	ctx := r.Context()
 
@@ -255,6 +240,10 @@ func (api *RestAPI) buildReferencedTrips(ctx context.Context, agencyID string, t
 	referencedTrips := []*models.Trip{}
 
 	for _, tripID := range tripsToInclude {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		_, refTripID, err := utils.ExtractAgencyIDAndCodeID(tripID)
 		if err != nil {
 			continue
@@ -337,6 +326,10 @@ func (api *RestAPI) buildStopReferences(ctx context.Context, calc *GTFS.Advanced
 
 	routesByStop := make(map[string][]gtfsdb.Route)
 	for _, routeRow := range allRoutes {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		route := gtfsdb.Route{
 			ID:        routeRow.ID,
 			AgencyID:  routeRow.AgencyID,
@@ -355,6 +348,10 @@ func (api *RestAPI) buildStopReferences(ctx context.Context, calc *GTFS.Advanced
 	processedStops := make(map[string]bool)
 
 	for _, st := range stopTimes {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		_, originalStopID, err := utils.ExtractAgencyIDAndCodeID(st.StopID)
 		if err != nil {
 			continue
@@ -401,6 +398,10 @@ func (api *RestAPI) BuildRouteReference(ctx context.Context, agencyID string, st
 	originalRouteIDs := make([]string, 0)
 
 	for _, stop := range stops {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		for _, routeID := range stop.StaticRouteIDs {
 			_, originalRouteID, err := utils.ExtractAgencyIDAndCodeID(routeID)
 			if err != nil {
@@ -425,6 +426,10 @@ func (api *RestAPI) BuildRouteReference(ctx context.Context, agencyID string, st
 
 	modelRoutes := make([]models.Route, 0, len(routes))
 	for _, route := range routes {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		routeModel := models.Route{
 			ID:                utils.FormCombinedID(agencyID, route.ID),
 			AgencyID:          agencyID,

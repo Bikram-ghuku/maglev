@@ -481,17 +481,7 @@ func TestBuildApplicationWithConfigFile(t *testing.T) {
 		// Convert to app and GTFS configs
 		cfg := jsonConfig.ToAppConfig()
 		gtfsCfgData := jsonConfig.ToGtfsConfigData()
-		gtfsCfg := gtfs.Config{
-			GtfsURL:                 gtfsCfgData.GtfsURL,
-			TripUpdatesURL:          gtfsCfgData.TripUpdatesURL,
-			VehiclePositionsURL:     gtfsCfgData.VehiclePositionsURL,
-			ServiceAlertsURL:        gtfsCfgData.ServiceAlertsURL,
-			RealTimeAuthHeaderKey:   gtfsCfgData.RealTimeAuthHeaderKey,
-			RealTimeAuthHeaderValue: gtfsCfgData.RealTimeAuthHeaderValue,
-			GTFSDataPath:            gtfsCfgData.GTFSDataPath,
-			Env:                     gtfsCfgData.Env,
-			Verbose:                 gtfsCfgData.Verbose,
-		}
+		gtfsCfg := gtfsConfigFromData(gtfsCfgData)
 
 		// Build application
 		coreApp, err := BuildApplication(cfg, gtfsCfg)
@@ -551,20 +541,7 @@ func TestDumpConfigJSON_WithExampleFile(t *testing.T) {
 
 	// Convert to GTFS config
 	gtfsCfgData := jsonConfig.ToGtfsConfigData()
-	gtfsCfg := gtfs.Config{
-		GtfsURL:                 gtfsCfgData.GtfsURL,
-		StaticAuthHeaderKey:     gtfsCfgData.StaticAuthHeaderKey,
-		StaticAuthHeaderValue:   gtfsCfgData.StaticAuthHeaderValue,
-		TripUpdatesURL:          gtfsCfgData.TripUpdatesURL,
-		VehiclePositionsURL:     gtfsCfgData.VehiclePositionsURL,
-		ServiceAlertsURL:        gtfsCfgData.ServiceAlertsURL,
-		RealTimeAuthHeaderKey:   gtfsCfgData.RealTimeAuthHeaderKey,
-		RealTimeAuthHeaderValue: gtfsCfgData.RealTimeAuthHeaderValue,
-		GTFSDataPath:            gtfsCfgData.GTFSDataPath,
-		Env:                     gtfsCfgData.Env,
-		Verbose:                 gtfsCfgData.Verbose,
-		EnableGTFSTidy:          gtfsCfgData.EnableGTFSTidy,
-	}
+	gtfsCfg := gtfsConfigFromData(gtfsCfgData)
 
 	// Make a pipe to capture stdout
 	oldStdout := os.Stdout

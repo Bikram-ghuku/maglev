@@ -12,8 +12,8 @@ import (
 func (api *RestAPI) routesForLocationHandler(w http.ResponseWriter, r *http.Request) {
 	queryParams := r.URL.Query()
 
-	lat, fieldErrors := utils.ParseFloatParam(queryParams, "lat", nil)
-	lon, _ := utils.ParseFloatParam(queryParams, "lon", fieldErrors)
+	lat, fieldErrors := utils.ParseRequiredFloatParam(queryParams, "lat", nil)
+	lon, _ := utils.ParseRequiredFloatParam(queryParams, "lon", fieldErrors)
 	radius, _ := utils.ParseFloatParam(queryParams, "radius", fieldErrors)
 	latSpan, _ := utils.ParseFloatParam(queryParams, "latSpan", fieldErrors)
 	lonSpan, _ := utils.ParseFloatParam(queryParams, "lonSpan", fieldErrors)
@@ -53,7 +53,7 @@ func (api *RestAPI) routesForLocationHandler(w http.ResponseWriter, r *http.Requ
 
 	// Check if context is already cancelled
 	if ctx.Err() != nil {
-		api.serverErrorResponse(w, r, ctx.Err())
+		api.clientCanceledResponse(w, r, ctx.Err())
 		return
 	}
 
@@ -77,11 +77,11 @@ func (api *RestAPI) routesForLocationHandler(w http.ResponseWriter, r *http.Requ
 		agencies := utils.FilterAgencies(api.GtfsManager.GetAgencies(), agencyIDs)
 		references := models.ReferencesModel{
 			Agencies:   agencies,
-			Routes:     []interface{}{},
-			Situations: []interface{}{},
-			StopTimes:  []interface{}{},
+			Routes:     []models.Route{},
+			Situations: []models.Situation{},
+			StopTimes:  []models.RouteStopTime{},
 			Stops:      []models.Stop{},
-			Trips:      []interface{}{},
+			Trips:      []models.Trip{},
 		}
 		response := models.NewListResponseWithRange(results, references, checkIfOutOfBounds(api, lat, lon, latSpan, lonSpan, radius), api.Clock, false)
 		api.sendResponse(w, r, response)
@@ -96,9 +96,11 @@ func (api *RestAPI) routesForLocationHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	isLimitExceeded := false
+	var resultRawRouteIDs []string
 	// Process routes and filter by query if provided
 	for _, routeRow := range routesForStops {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
@@ -110,6 +112,7 @@ func (api *RestAPI) routesForLocationHandler(w http.ResponseWriter, r *http.Requ
 
 		if !routeIDs[combinedRouteID] {
 			agencyIDs[routeRow.AgencyID] = true
+			resultRawRouteIDs = append(resultRawRouteIDs, routeRow.ID)
 
 			results = append(results, models.NewRoute(
 				combinedRouteID,
@@ -130,18 +133,23 @@ func (api *RestAPI) routesForLocationHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	if ctx.Err() != nil {
+		api.clientCanceledResponse(w, r, ctx.Err())
 		return
 	}
 
 	agencies := utils.FilterAgencies(api.GtfsManager.GetAgencies(), agencyIDs)
 
+	// Populate situation references for alerts affecting the returned routes
+	alerts := api.collectAlertsForRoutes(resultRawRouteIDs)
+	situations := api.BuildSituationReferences(alerts)
+
 	references := models.ReferencesModel{
 		Agencies:   agencies,
-		Routes:     []interface{}{},
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
+		Routes:     []models.Route{},
+		Situations: situations,
+		StopTimes:  []models.RouteStopTime{},
 		Stops:      []models.Stop{},
-		Trips:      []interface{}{},
+		Trips:      []models.Trip{},
 	}
 
 	response := models.NewListResponseWithRange(results, references, checkIfOutOfBounds(api, lat, lon, latSpan, lonSpan, radius), api.Clock, isLimitExceeded)

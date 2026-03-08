@@ -2,6 +2,7 @@ package restapi
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"maglev.onebusaway.org/gtfsdb"
@@ -75,6 +76,8 @@ func (api *RestAPI) scheduleForRouteHandler(w http.ResponseWriter, r *http.Reque
 			ScheduleDate:      scheduleDate,
 			ServiceIDs:        []string{},
 			StopTripGroupings: []models.StopTripGrouping{},
+			Stops:             []models.Stop{},
+			Trips:             []models.Trip{},
 		}
 		api.sendResponse(w, r, models.NewEntryResponse(entry, models.NewEmptyReferences(), api.Clock))
 		return
@@ -102,6 +105,8 @@ func (api *RestAPI) scheduleForRouteHandler(w http.ResponseWriter, r *http.Reque
 			ScheduleDate:      scheduleDate,
 			ServiceIDs:        combinedServiceIDs,
 			StopTripGroupings: []models.StopTripGrouping{},
+			Stops:             []models.Stop{},
+			Trips:             []models.Trip{},
 		}
 		api.sendResponse(w, r, models.NewEntryResponse(entry, models.NewEmptyReferences(), api.Clock))
 		return
@@ -136,9 +141,10 @@ func (api *RestAPI) scheduleForRouteHandler(w http.ResponseWriter, r *http.Reque
 	}
 	var stopTripGroupings []models.StopTripGrouping
 	globalStopIDSet := make(map[string]struct{})
-	var stopTimesRefs []interface{}
+	var stopTimesRefs [][]models.RouteStopTime
 	for dirID, groupedTrips := range groupings {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
@@ -227,6 +233,9 @@ func (api *RestAPI) scheduleForRouteHandler(w http.ResponseWriter, r *http.Reque
 	for tid := range tripIDsSet {
 		tripIDs = append(tripIDs, tid)
 	}
+
+	entryTrips := make([]models.Trip, 0)
+
 	if len(tripIDs) > 0 {
 		tripRows, err := api.GtfsManager.GtfsDB.Queries.GetTripsByIDs(ctx, tripIDs)
 		if err != nil {
@@ -242,11 +251,12 @@ func (api *RestAPI) scheduleForRouteHandler(w http.ResponseWriter, r *http.Reque
 				t.ServiceID,
 				t.TripHeadsign.String,
 				t.TripShortName.String,
-				t.DirectionID.Int64,
+				strconv.FormatInt(t.DirectionID.Int64, 10),
 				utils.FormCombinedID(agencyID, t.BlockID.String),
 				utils.FormCombinedID(agencyID, t.ShapeID.String),
 			)
-			references.Trips = append(references.Trips, tripRef)
+			references.Trips = append(references.Trips, *tripRef)
+			entryTrips = append(entryTrips, *tripRef)
 		}
 	}
 
@@ -254,6 +264,9 @@ func (api *RestAPI) scheduleForRouteHandler(w http.ResponseWriter, r *http.Reque
 	for sid := range globalStopIDSet {
 		uniqueStopIDs = append(uniqueStopIDs, sid)
 	}
+
+	entryStops := make([]models.Stop, 0)
+
 	if len(uniqueStopIDs) > 0 {
 
 		modelStops, _, err := BuildStopReferencesAndRouteIDsForStops(api, ctx, agencyID, uniqueStopIDs)
@@ -262,23 +275,11 @@ func (api *RestAPI) scheduleForRouteHandler(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		references.Stops = append(references.Stops, modelStops...)
+		entryStops = modelStops
 	}
 
 	for _, sref := range stopTimesRefs {
-		switch v := sref.(type) {
-		case []models.RouteStopTime:
-			for _, st := range v {
-				references.StopTimes = append(references.StopTimes, st)
-			}
-		case []map[string]interface{}:
-			for _, st := range v {
-				references.StopTimes = append(references.StopTimes, st)
-			}
-		case []interface{}:
-			references.StopTimes = append(references.StopTimes, v...)
-		default:
-			references.StopTimes = append(references.StopTimes, v)
-		}
+		references.StopTimes = append(references.StopTimes, sref...)
 	}
 
 	entry := models.ScheduleForRouteEntry{
@@ -286,6 +287,8 @@ func (api *RestAPI) scheduleForRouteHandler(w http.ResponseWriter, r *http.Reque
 		ScheduleDate:      scheduleDate,
 		ServiceIDs:        combinedServiceIDs,
 		StopTripGroupings: stopTripGroupings,
+		Stops:             entryStops,
+		Trips:             entryTrips,
 	}
 	api.sendResponse(w, r, models.NewEntryResponse(entry, references, api.Clock))
 }

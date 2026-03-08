@@ -15,7 +15,7 @@ func (api *RestAPI) agenciesWithCoverageHandler(w http.ResponseWriter, r *http.R
 
 	// Check if context is already cancelled
 	if ctx.Err() != nil {
-		api.serverErrorResponse(w, r, ctx.Err())
+		api.clientCanceledResponse(w, r, ctx.Err())
 		return
 	}
 
@@ -59,11 +59,11 @@ func (api *RestAPI) agenciesWithCoverageHandler(w http.ResponseWriter, r *http.R
 	// Create references with the agency
 	references := models.ReferencesModel{
 		Agencies:   agencyReferences,
-		Routes:     []interface{}{},
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
+		Routes:     []models.Route{},
+		Situations: []models.Situation{},
+		StopTimes:  []models.RouteStopTime{},
 		Stops:      []models.Stop{},
-		Trips:      []interface{}{},
+		Trips:      []models.Trip{},
 	}
 
 	response := models.NewListResponse(agenciesWithCoverage, references, limitExceeded, api.Clock)

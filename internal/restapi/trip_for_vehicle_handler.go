@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"maglev.onebusaway.org/gtfsdb"
@@ -38,13 +39,6 @@ func (api *RestAPI) tripForVehicleHandler(w http.ResponseWriter, r *http.Request
 
 	ctx := r.Context()
 
-	// Capture parsing errors
-	params, fieldErrors := api.parseTripParams(r, false)
-	if len(fieldErrors) > 0 {
-		api.validationErrorResponse(w, r, fieldErrors)
-		return
-	}
-
 	tripID := vehicle.Trip.ID.ID
 
 	agency, err := api.GtfsManager.GtfsDB.Queries.GetAgency(ctx, agencyID)
@@ -55,9 +49,17 @@ func (api *RestAPI) tripForVehicleHandler(w http.ResponseWriter, r *http.Request
 
 	loc := utils.LoadLocationWithUTCFallBack(agency.Timezone, agency.ID)
 
+	// Parse query params with the agency's timezone so that serviceDate and time
+	// are localized at parse time, preventing UTC date-extraction bugs.
+	params, fieldErrors := api.parseTripParams(r, false, loc)
+	if len(fieldErrors) > 0 {
+		api.validationErrorResponse(w, r, fieldErrors)
+		return
+	}
+
 	var currentTime time.Time
 	if params.Time != nil {
-		currentTime = params.Time.In(loc)
+		currentTime = *params.Time
 	} else {
 		currentTime = api.Clock.Now().In(loc)
 	}
@@ -190,11 +192,11 @@ func (api *RestAPI) tripForVehicleHandler(w http.ResponseWriter, r *http.Request
 			utils.FormCombinedID(agencyID, trip.ServiceID),
 			trip.TripHeadsign.String,
 			trip.TripShortName.String,
-			trip.DirectionID.Int64,
+			strconv.FormatInt(trip.DirectionID.Int64, 10),
 			utils.FormCombinedID(agencyID, trip.BlockID.String),
 			utils.FormCombinedID(agencyID, trip.ShapeID.String),
 		)
-		references.Trips = append(references.Trips, tripRef)
+		references.Trips = append(references.Trips, *tripRef)
 	}
 
 	response := models.NewEntryResponse(entry, references, api.Clock)

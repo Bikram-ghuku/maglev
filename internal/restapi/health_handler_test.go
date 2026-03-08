@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,7 +38,7 @@ func TestHealthHandlerWithNilApplication(t *testing.T) {
 
 func TestHealthHandlerReturnsOK(t *testing.T) {
 	// Use in-memory DB to test the health check successfully
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open(gtfsdb.DriverName, ":memory:")
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -47,6 +48,8 @@ func TestHealthHandlerReturnsOK(t *testing.T) {
 			DB: db,
 		},
 	}
+
+	manager.SetFeedExpiresAt(time.Now().Add(24 * time.Hour))
 
 	// Mark the manager as ready (simulating completed initialization)
 	manager.MarkReady()
@@ -74,11 +77,56 @@ func TestHealthHandlerReturnsOK(t *testing.T) {
 	err = json.NewDecoder(resp.Body).Decode(&healthResp)
 	require.NoError(t, err)
 	assert.Equal(t, "ok", healthResp.Status)
+	assert.NotEmpty(t, healthResp.FeedExpiresAt)
+	assert.False(t, healthResp.DataExpired)
+}
+
+func TestHealthHandlerReturnsExpired(t *testing.T) {
+
+	db, err := sql.Open(gtfsdb.DriverName, ":memory:")
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	manager := &gtfs.Manager{
+		GtfsDB: &gtfsdb.Client{
+			DB: db,
+		},
+	}
+
+	manager.SetFeedExpiresAt(time.Now().Add(-24 * time.Hour))
+
+	manager.MarkReady()
+
+	app := &app.Application{
+		GtfsManager: manager,
+		Config: appconf.Config{
+			RateLimit: 100,
+		},
+	}
+
+	api := NewRestAPI(app)
+	mux := http.NewServeMux()
+	api.SetRoutes(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/healthz")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var healthResp HealthResponse
+	err = json.NewDecoder(resp.Body).Decode(&healthResp)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", healthResp.Status)
+	assert.NotEmpty(t, healthResp.FeedExpiresAt)
+	assert.True(t, healthResp.DataExpired)
 }
 
 func TestHealthHandlerStarting(t *testing.T) {
 	// Use in-memory DB to test the health check during startup
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open(gtfsdb.DriverName, ":memory:")
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 

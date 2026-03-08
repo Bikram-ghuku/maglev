@@ -80,7 +80,7 @@ func rawGtfsData(source string, isLocalFile bool, config Config) ([]byte, error)
 	return b, nil
 }
 
-func buildGtfsDB(config Config, isLocalFile bool, dbPath string) (*gtfsdb.Client, error) {
+func buildGtfsDB(ctx context.Context, config Config, isLocalFile bool, dbPath string) (*gtfsdb.Client, error) {
 	// If no specific path is provided, use the one from config
 	if dbPath == "" {
 		dbPath = config.GTFSDataPath
@@ -91,8 +91,6 @@ func buildGtfsDB(config Config, isLocalFile bool, dbPath string) (*gtfsdb.Client
 		return nil, fmt.Errorf("failed to create GTFS database client: %w", err)
 	}
 
-	ctx := context.Background()
-
 	if isLocalFile {
 		err = client.ImportFromFile(ctx, config.GtfsURL)
 	} else {
@@ -100,7 +98,15 @@ func buildGtfsDB(config Config, isLocalFile bool, dbPath string) (*gtfsdb.Client
 	}
 
 	if err != nil {
+		_ = client.Close() // Close the client on error to prevent connection leaks on retries
 		return nil, err
+	}
+
+	// Backfill cached time bounds for O(1) trip lookups
+	logger := slog.Default().With(slog.String("component", "gtfs_db_builder"))
+	logging.LogOperation(logger, "calculating_trip_time_bounds")
+	if err := client.Queries.BulkUpdateTripTimeBounds(ctx); err != nil {
+		return nil, fmt.Errorf("failed to bulk update trip time bounds: %w", err)
 	}
 
 	// Precompute stop directions after GTFS data is loaded
@@ -197,6 +203,12 @@ func (manager *Manager) ForceUpdate(ctx context.Context) error {
 		return err
 	}
 
+	// Validate the structural integrity of the in-memory data before proceeding
+	if err := gtfsdb.ValidateGTFSData(newStaticData); err != nil {
+		logging.LogError(logger, "GTFS structural validation failed during periodic update", err)
+		return fmt.Errorf("GTFS validation failed during update: %w", err)
+	}
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -208,7 +220,7 @@ func (manager *Manager) ForceUpdate(ctx context.Context) error {
 		logging.LogError(logger, "Failed to remove existing temp DB", err)
 	}
 
-	newGtfsDB, err := buildGtfsDB(manager.config, manager.isLocalFile, tempDBPath)
+	newGtfsDB, err := buildGtfsDB(ctx, manager.config, manager.isLocalFile, tempDBPath)
 	if err != nil {
 		logging.LogError(logger, "Error building new GTFS DB", err)
 		return err
@@ -312,6 +324,12 @@ func (manager *Manager) ForceUpdate(ctx context.Context) error {
 
 	manager.routesByAgencyID = buildRouteIndex(newStaticData)
 
+	if newCache, freqErr := buildFrequencyCache(ctx, client.Queries); freqErr == nil {
+		manager.frequencyTripIDs = newCache
+	} else {
+		logging.LogError(logger, "failed to reload frequency trip IDs during hot-swap; retaining previous cache", freqErr)
+	}
+
 	manager.lastUpdated = time.Now()
 
 	metadata, err := manager.GtfsDB.Queries.GetImportMetadata(ctx)
@@ -332,6 +350,8 @@ func (manager *Manager) ForceUpdate(ctx context.Context) error {
 		slog.String("source", manager.config.GtfsURL),
 		slog.String("db_path", finalDBPath),
 		slog.Int("route_index_agencies", len(manager.routesByAgencyID)))
+
+	manager.parseAndLogFeedExpiryLocked(ctx, logger)
 
 	return nil
 }
@@ -354,6 +374,8 @@ func (manager *Manager) setStaticGTFS(staticData *gtfs.Static) {
 
 	// Rebuild spatial index with updated data
 	ctx := context.Background()
+
+	// GtfsDB may be nil during initial construction; frequency cache is populated by InitGTFSManager directly
 	if manager.GtfsDB != nil && manager.GtfsDB.Queries != nil {
 		spatialIndex, err := buildStopSpatialIndex(ctx, manager.GtfsDB.Queries)
 		if err == nil {
@@ -361,6 +383,13 @@ func (manager *Manager) setStaticGTFS(staticData *gtfs.Static) {
 		} else if manager.config.Verbose {
 			logger := slog.Default().With(slog.String("component", "gtfs_manager"))
 			logging.LogError(logger, "Failed to rebuild spatial index", err)
+		}
+
+		if newCache, freqErr := buildFrequencyCache(ctx, manager.GtfsDB.Queries); freqErr == nil {
+			manager.frequencyTripIDs = newCache
+		} else {
+			logger := slog.Default().With(slog.String("component", "gtfs_manager"))
+			logging.LogError(logger, "failed to load frequency trip IDs during initial load; retaining previous cache", freqErr)
 		}
 
 		logger := slog.Default().With(slog.String("component", "gtfs_manager"))
@@ -410,4 +439,73 @@ func buildRouteIndex(staticData *gtfs.Static) map[string][]*gtfs.Route {
 	}
 
 	return index
+}
+
+// buildFrequencyCache queries the DB for frequency trip IDs and returns a set.
+// It returns an error if the query fails, allowing the caller to retain the previous cache.
+func buildFrequencyCache(ctx context.Context, queries *gtfsdb.Queries) (map[string]struct{}, error) {
+	ids, err := queries.GetFrequencyTripIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	cache := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		cache[id] = struct{}{}
+	}
+
+	return cache, nil
+}
+
+// parseAndLogFeedExpiryLocked checks the GTFS calendar for the last active service date
+// NOTE: Caller must guarantee thread-safety
+func (manager *Manager) parseAndLogFeedExpiryLocked(ctx context.Context, logger *slog.Logger) {
+	manager.feedExpiresAt = time.Time{}
+	if manager.Metrics != nil && manager.Metrics.FeedExpiresAt != nil {
+		manager.Metrics.FeedExpiresAt.Set(0)
+	}
+
+	if manager.GtfsDB == nil || manager.GtfsDB.Queries == nil {
+		return
+	}
+
+	val, err := manager.GtfsDB.Queries.GetFeedEndDate(ctx)
+	if err != nil {
+		logging.LogError(logger, "Failed to get feed end date from DB", err)
+		return
+	}
+
+	strVal, _ := val.(string)
+
+	if strVal != "" {
+		parsedTime, err := time.Parse("20060102", strVal)
+		if err != nil {
+			logging.LogError(logger, "Failed to parse feed end date", err, slog.String("date", strVal))
+			return
+		}
+
+		// 23:59:59 end date
+		expiresAt := parsedTime.Add(24 * time.Hour).Add(-time.Second)
+
+		manager.feedExpiresAt = expiresAt
+
+		if manager.Metrics != nil && manager.Metrics.FeedExpiresAt != nil {
+			manager.Metrics.FeedExpiresAt.Set(float64(expiresAt.Unix()))
+		}
+
+		daysUntil := int(time.Until(expiresAt).Hours() / 24)
+		if daysUntil < 0 {
+			logger.Warn("GTFS feed has expired", slog.Time("expires_at", expiresAt), slog.Int("days_overdue", -daysUntil))
+		} else if daysUntil <= 1 {
+			logger.Warn("GTFS feed expires in 1 day or less", slog.Time("expires_at", expiresAt))
+		} else if daysUntil <= 3 {
+			logger.Warn("GTFS feed expires in 3 days or less", slog.Time("expires_at", expiresAt))
+		} else if daysUntil <= 7 {
+			logger.Warn("GTFS feed expires in 7 days or less", slog.Time("expires_at", expiresAt))
+		} else {
+			logger.Info("GTFS feed valid", slog.Time("expires_at", expiresAt), slog.Int("days_until_expiry", daysUntil))
+		}
+	} else {
+		logger.Warn("GTFS feed has no active calendar dates")
+	}
 }

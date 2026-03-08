@@ -16,7 +16,7 @@ func (api *RestAPI) stopsForAgencyHandler(w http.ResponseWriter, r *http.Request
 
 	// Check if context is already cancelled
 	if ctx.Err() != nil {
-		api.serverErrorResponse(w, r, ctx.Err())
+		api.clientCanceledResponse(w, r, ctx.Err())
 		return
 	}
 
@@ -58,7 +58,7 @@ func (api *RestAPI) stopsForAgencyHandler(w http.ResponseWriter, r *http.Request
 	)
 
 	// Build route references from stops
-	routeRefs, err := api.BuildRouteReferencesAsInterface(ctx, id, stopsList)
+	routeRefs, err := api.BuildRouteReferences(ctx, id, stopsList)
 	if err != nil {
 		api.serverErrorResponse(w, r, err)
 		return
@@ -68,10 +68,10 @@ func (api *RestAPI) stopsForAgencyHandler(w http.ResponseWriter, r *http.Request
 	references := models.ReferencesModel{
 		Agencies:   []models.AgencyReference{agencyRef},
 		Routes:     routeRefs,
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
+		Situations: []models.Situation{},
+		StopTimes:  []models.RouteStopTime{},
 		Stops:      []models.Stop{},
-		Trips:      []interface{}{},
+		Trips:      []models.Trip{},
 	}
 
 	response := models.NewListResponse(stopsList, references, false, api.Clock)

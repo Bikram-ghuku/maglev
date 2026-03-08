@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -11,10 +12,11 @@ import (
 	"time"
 
 	"maglev.onebusaway.org/gtfsdb"
+	"maglev.onebusaway.org/internal/metrics"
+	"maglev.onebusaway.org/internal/models"
 	"maglev.onebusaway.org/internal/utils"
 
 	"github.com/OneBusAway/go-gtfs"
-	_ "github.com/mattn/go-sqlite3" // CGo-based SQLite driver
 	"github.com/tidwall/rtree"
 	"maglev.onebusaway.org/internal/logging"
 )
@@ -29,7 +31,14 @@ type RegionBounds struct {
 	LonSpan float64
 }
 
-// Manager manages the GTFS data and provides methods to access it
+// Manager manages the GTFS data and provides methods to access it.
+//
+// Lock ordering policy (to prevent deadlocks):
+//
+//	staticMutex → realTimeMutex
+//
+// When both locks are needed, staticMutex MUST be acquired first.
+// Never acquire staticMutex while holding realTimeMutex.
 type Manager struct {
 	gtfsData                       *gtfs.Static
 	GtfsDB                         *gtfsdb.Client
@@ -45,6 +54,7 @@ type Manager struct {
 	realTimeVehicleLookupByVehicle map[string]int
 	agenciesMap                    map[string]*gtfs.Agency
 	routesMap                      map[string]*gtfs.Route
+	frequencyTripIDs               map[string]struct{}
 	staticUpdateMutex              sync.Mutex   // Protects against concurrent ForceUpdate calls
 	staticMutex                    sync.RWMutex // Protects gtfsData and lastUpdated
 	config                         Config
@@ -58,13 +68,38 @@ type Manager struct {
 	systemETag                     string      // systemETag stores the SHA-256 hash of the currently loaded GTFS static dataset.
 	isReady                        atomic.Bool // Tracks whether initial data loading is complete
 
+	feedExpiresAt time.Time // Holds the max valid service date for the static feed
+
 	feedTrips    map[string][]gtfs.Trip
 	feedVehicles map[string][]gtfs.Vehicle
 	feedAlerts   map[string][]gtfs.Alert
+	// Per-feed agency filter: feedID -> set of allowed agency IDs.
+	// Populated once during InitGTFSManager before goroutines start; read-only thereafter.
+	// No lock is required for reads.
+	feedAgencyFilter map[string]map[string]bool
 	// Per-feed, per-vehicle last-seen timestamps for stale vehicle expiry
 	feedVehicleLastSeen map[string]map[string]time.Time // feedID -> vehicleID -> lastSeen
+
 	// Per-feed last successfully applied vehicle feed timestamp
 	feedVehicleTimestamp map[string]uint64 // feedID -> timestamp
+
+	// Exported metrics client dependency
+	Metrics *metrics.Metrics
+}
+
+// clearFeedData removes stale data for a specific feed when the staleness threshold is crossed
+func (manager *Manager) clearFeedData(feedID string) {
+	manager.realTimeMutex.Lock()
+	defer manager.realTimeMutex.Unlock()
+
+	manager.feedTrips[feedID] = nil
+	manager.feedVehicles[feedID] = nil
+	manager.feedAlerts[feedID] = nil
+
+	delete(manager.feedVehicleTimestamp, feedID)
+	delete(manager.feedVehicleLastSeen, feedID)
+
+	manager.rebuildMergedRealtimeLocked()
 }
 
 // IsReady returns true if the GTFS data is fully initialized and indexed.
@@ -79,12 +114,120 @@ func (manager *Manager) MarkReady() {
 
 // InitGTFSManager initializes the Manager with the GTFS data from the given source
 // The source can be either a URL or a local file path
-func InitGTFSManager(config Config) (*Manager, error) {
+func InitGTFSManager(ctx context.Context, config Config) (*Manager, error) {
 	isLocalFile := !strings.HasPrefix(config.GtfsURL, "http://") && !strings.HasPrefix(config.GtfsURL, "https://")
 
-	staticData, err := loadGTFSData(config.GtfsURL, isLocalFile, config)
-	if err != nil {
-		return nil, err
+	logger := slog.Default().With(slog.String("component", "gtfs_manager"))
+
+	var staticData *gtfs.Static
+	var gtfsDB *gtfsdb.Client
+	var err error
+
+	// Use configurable backoffs or default to production values
+	backoffs := config.StartupRetries
+	if len(backoffs) == 0 {
+		backoffs = []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second}
+	}
+	maxAttempts := len(backoffs) + 1
+
+	// Skip retries for local files - they will fail identically every time
+	if isLocalFile {
+		maxAttempts = 1
+	}
+
+	var attemptsMade int
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptsMade = attempt
+		// Attempt to load in-memory static data if we haven't already succeeded
+		if staticData == nil {
+			staticData, err = loadGTFSData(config.GtfsURL, isLocalFile, config)
+			if err != nil {
+				if attempt < maxAttempts {
+					delay := backoffs[attempt-1]
+					logging.LogError(logger, "Failed to load GTFS static data, retrying", err,
+						slog.Int("attempt", attempt),
+						slog.Int("max_attempts", maxAttempts),
+						slog.Duration("retry_delay", delay),
+					)
+
+					// Cancellable sleep
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(delay):
+					}
+					continue
+				}
+				return nil, fmt.Errorf("failed to load GTFS data after %d attempts: %w", maxAttempts, err)
+			}
+
+			// Perform structural validation on the in-memory data
+			if err = gtfsdb.ValidateGTFSData(staticData); err != nil {
+				if attempt < maxAttempts {
+					delay := backoffs[attempt-1]
+					logging.LogError(logger, "GTFS static data structural validation failed, retrying", err,
+						slog.Int("attempt", attempt),
+						slog.Int("max_attempts", maxAttempts),
+						slog.Duration("retry_delay", delay),
+					)
+
+					// Reset staticData to nil so the retry loop fetches it again
+					staticData = nil
+
+					// Cancellable sleep
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(delay):
+					}
+					continue
+				}
+				return nil, fmt.Errorf("failed GTFS structural validation after %d attempts: %w", maxAttempts, err)
+			}
+		}
+
+		// Attempt to build the SQLite DB if we haven't already succeeded
+		if gtfsDB == nil {
+			// Clean up partial SQLite file from previous failed attempts
+			if attempt > 1 && config.GTFSDataPath != "" && config.GTFSDataPath != ":memory:" {
+				if removeErr := os.Remove(config.GTFSDataPath); removeErr != nil && !os.IsNotExist(removeErr) {
+					logging.LogError(logger, "Failed to clean up partial SQLite file before retry", removeErr,
+						slog.String("path", config.GTFSDataPath),
+						slog.Int("attempt", attempt),
+					)
+				}
+			}
+
+			gtfsDB, err = buildGtfsDB(ctx, config, isLocalFile, "")
+			if err != nil {
+				if attempt < maxAttempts {
+					delay := backoffs[attempt-1]
+					logging.LogError(logger, "Failed to build GTFS database, retrying", err,
+						slog.Int("attempt", attempt),
+						slog.Int("max_attempts", maxAttempts),
+						slog.Duration("retry_delay", delay),
+					)
+
+					// Cancellable sleep
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(delay):
+					}
+					continue
+				}
+				return nil, fmt.Errorf("failed to build GTFS database after %d attempts: %w", maxAttempts, err)
+			}
+		}
+
+		// Both loads succeeded, break out of the retry loop
+		break
+	}
+
+	// Log success if we recovered via retries
+	if attemptsMade > 1 {
+		logger.Info("GTFS data loaded after retry", slog.Int("attempts", attemptsMade))
 	}
 
 	manager := &Manager{
@@ -97,25 +240,66 @@ func InitGTFSManager(config Config) (*Manager, error) {
 		feedTrips:                      make(map[string][]gtfs.Trip),
 		feedVehicles:                   make(map[string][]gtfs.Vehicle),
 		feedAlerts:                     make(map[string][]gtfs.Alert),
+		feedAgencyFilter:               make(map[string]map[string]bool),
 		feedVehicleLastSeen:            make(map[string]map[string]time.Time),
 		feedVehicleTimestamp:           make(map[string]uint64),
+		frequencyTripIDs:               make(map[string]struct{}),
+		Metrics:                        config.Metrics,
 	}
-	manager.setStaticGTFS(staticData)
 
-	gtfsDB, err := buildGtfsDB(config, isLocalFile, "")
-	if err != nil {
-		return nil, fmt.Errorf("error building GTFS database: %w", err)
+	// Build per-feed agency filters from config
+	for _, feedCfg := range config.RTFeeds {
+		if len(feedCfg.AgencyIDs) > 0 {
+			filter := make(map[string]bool, len(feedCfg.AgencyIDs))
+			for _, id := range feedCfg.AgencyIDs {
+				filter[id] = true
+			}
+			manager.feedAgencyFilter[feedCfg.ID] = filter
+		}
 	}
+
+	manager.setStaticGTFS(staticData)
 	manager.GtfsDB = gtfsDB
 
+	// Startup validation and logging for agency filtering
+	enabledFeeds := config.enabledFeeds()
+	for _, feedCfg := range enabledFeeds {
+		if len(feedCfg.AgencyIDs) > 0 {
+			logger.Info("realtime feed agency filtering active",
+				slog.String("feed", feedCfg.ID),
+				slog.Any("agency_ids", feedCfg.AgencyIDs),
+			)
+
+			manager.staticMutex.RLock()
+			var validAgencies []string
+			for _, configuredAgencyID := range feedCfg.AgencyIDs {
+				if _, exists := manager.agenciesMap[configuredAgencyID]; !exists {
+					if validAgencies == nil {
+						for validID := range manager.agenciesMap {
+							validAgencies = append(validAgencies, validID)
+						}
+						sort.Strings(validAgencies)
+					}
+
+					logger.Warn("configured agency-id not found in static GTFS data",
+						slog.String("feed", feedCfg.ID),
+						slog.String("invalid_agency_id", configuredAgencyID),
+						slog.Any("valid_agency_ids", validAgencies),
+					)
+				}
+			}
+			manager.staticMutex.RUnlock()
+		}
+	}
+	manager.parseAndLogFeedExpiryLocked(ctx, logger)
+
 	// Populate systemETag from import metadata
-	metadata, err := gtfsDB.Queries.GetImportMetadata(context.Background())
+	metadata, err := gtfsDB.Queries.GetImportMetadata(ctx)
 	if err == nil && metadata.FileHash != "" {
 		manager.systemETag = fmt.Sprintf(`"%s"`, metadata.FileHash)
 	}
 
 	// Build spatial index for fast stop location queries
-	ctx := context.Background()
 	spatialIndex, err := buildStopSpatialIndex(ctx, gtfsDB.Queries)
 	if err != nil {
 		_ = gtfsDB.Close()
@@ -123,13 +307,27 @@ func InitGTFSManager(config Config) (*Manager, error) {
 	}
 	manager.stopSpatialIndex = spatialIndex
 
+	freqTripIDs := make(map[string]struct{})
+	ids, err := gtfsDB.Queries.GetFrequencyTripIDs(ctx)
+	if err == nil {
+		for _, id := range ids {
+			freqTripIDs[id] = struct{}{}
+		}
+	} else {
+		logger.Error("failed to load frequency trip IDs", "error", err)
+	}
+	manager.frequencyTripIDs = freqTripIDs
+
 	// STARTUP SEQUENCING:
 	// If realtime is enabled, perform the first fetch synchronously for each feed
 	// to "warm" the cache before marking the manager as ready.
-	enabledFeeds := config.enabledFeeds()
 	for _, feedCfg := range enabledFeeds {
-		initCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		manager.updateFeedRealtime(initCtx, feedCfg)
+		initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		success := manager.updateFeedRealtime(initCtx, feedCfg)
+		if !success {
+			logger.Warn("initial realtime fetch failed; feed starting in degraded state",
+				slog.String("feed", feedCfg.ID))
+		}
 		cancel()
 	}
 
@@ -266,9 +464,11 @@ func (manager *Manager) GetStopsForLocation(
 	} else {
 		if radius == 0 {
 			if query != "" {
-				radius = 10000
+				// Use a global radius (20,000 km) to ensure exact stop code
+				// searches are never artificially truncated by localized bounding boxes.
+				radius = models.GlobalSearchRadiusInMeters
 			} else {
-				radius = 500
+				radius = models.DefaultSearchRadiusInMeters // Standard constant for radius
 			}
 		}
 		bounds = utils.CalculateBounds(lat, lon, radius)
@@ -350,6 +550,10 @@ func (manager *Manager) GetStopsForLocation(
 
 			// Get active service IDs for current date
 			activeServiceIDs, err := manager.GtfsDB.Queries.GetActiveServiceIDsForDate(ctx, currentDate)
+			if err != nil {
+				logger := slog.Default().With(slog.String("component", "gtfs_manager"))
+				logging.LogError(logger, "could not get active service IDs for date", err, slog.String("date", currentDate))
+			}
 
 			if err == nil && len(activeServiceIDs) > 0 {
 				stopIDs := make([]string, 0, len(candidates))
@@ -361,6 +565,10 @@ func (manager *Manager) GetStopsForLocation(
 					StopIds:    stopIDs,
 					ServiceIds: activeServiceIDs,
 				})
+				if err != nil {
+					logger := slog.Default().With(slog.String("component", "gtfs_manager"))
+					logging.LogError(logger, "could not get stops with active service on date", err, slog.String("date", currentDate))
+				}
 
 				if err == nil {
 					stopsWithService := make(map[string]bool)
@@ -399,20 +607,26 @@ func (manager *Manager) GetStopsForLocation(
 	return stops
 }
 
-// IMPORTANT: Caller must hold manager.RLock() before calling this method.
+// VehiclesForAgencyID returns all real-time vehicles serving routes that belong
+// to the given agency. It manages its own locking internally; callers must NOT
+// hold any Manager locks.
 func (manager *Manager) VehiclesForAgencyID(agencyID string) []gtfs.Vehicle {
+	// Step 1: Acquire static lock, collect route IDs, then release.
+	manager.staticMutex.RLock()
 	routes := manager.RoutesForAgencyID(agencyID)
-	routeIDs := make(map[string]bool) // all route IDs for the agency.
+	routeIDs := make(map[string]bool, len(routes))
 	for _, route := range routes {
 		routeIDs[route.Id] = true
 	}
+	manager.staticMutex.RUnlock()
+
+	// Step 2: Acquire real-time lock independently to read vehicles.
+	rtVehicles := manager.GetRealTimeVehicles()
 
 	var vehicles []gtfs.Vehicle
-	for _, v := range manager.GetRealTimeVehicles() {
-		if v.Trip != nil {
-			if routeIDs[v.Trip.ID.RouteID] {
-				vehicles = append(vehicles, v)
-			}
+	for _, v := range rtVehicles {
+		if v.Trip != nil && routeIDs[v.Trip.ID.RouteID] {
+			vehicles = append(vehicles, v)
 		}
 	}
 
@@ -424,6 +638,14 @@ func (manager *Manager) VehiclesForAgencyID(agencyID string) []gtfs.Vehicle {
 // but is part of the same block.
 // IMPORTANT: Caller must hold manager.RLock() before calling this method.
 func (manager *Manager) GetVehicleForTrip(ctx context.Context, tripID string) *gtfs.Vehicle {
+
+	manager.realTimeMutex.RLock()
+	if index, exists := manager.realTimeVehicleLookupByTrip[tripID]; exists {
+		vehicle := manager.realTimeVehicles[index]
+		manager.realTimeMutex.RUnlock()
+		return &vehicle
+	}
+	manager.realTimeMutex.RUnlock()
 
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -490,10 +712,8 @@ func (manager *Manager) GetTripUpdatesForTrip(tripID string) []gtfs.Trip {
 	defer manager.realTimeMutex.RUnlock()
 
 	var updates []gtfs.Trip
-	for _, v := range manager.realTimeTrips {
-		if v.ID.ID == tripID {
-			updates = append(updates, v)
-		}
+	if index, exists := manager.realTimeTripLookup[tripID]; exists {
+		updates = append(updates, manager.realTimeTrips[index])
 	}
 	return updates
 }
@@ -609,6 +829,20 @@ func (manager *Manager) MarkUnhealthy() {
 	manager.isHealthy = false
 }
 
+// FeedExpiresAt returns the parsed feed expiry time.
+func (manager *Manager) FeedExpiresAt() time.Time {
+	manager.staticMutex.RLock()
+	defer manager.staticMutex.RUnlock()
+	return manager.feedExpiresAt
+}
+
+// SetFeedExpiresAt implicitly sets the parsed feed expiry time for tests.
+func (manager *Manager) SetFeedExpiresAt(t time.Time) {
+	manager.staticMutex.Lock()
+	defer manager.staticMutex.Unlock()
+	manager.feedExpiresAt = t
+}
+
 // SetRealTimeTripsForTest manually sets realtime trips for testing purposes.
 // It stores the trips under the synthetic feed ID "_test" so that a subsequent
 // call to rebuildMergedRealtimeLocked (e.g. from a real feed update) does not
@@ -619,4 +853,16 @@ func (manager *Manager) SetRealTimeTripsForTest(trips []gtfs.Trip) {
 
 	manager.feedTrips["_test"] = trips
 	manager.rebuildMergedRealtimeLocked()
+}
+
+// AddTestAlert is a helper method used ONLY for testing to inject mock alerts safely.
+func (m *Manager) AddTestAlert(alert gtfs.Alert) {
+	m.realTimeMutex.Lock()
+	defer m.realTimeMutex.Unlock()
+	// Initialize the map if it doesn't exist
+	if m.feedAlerts == nil {
+		m.feedAlerts = make(map[string][]gtfs.Alert)
+	}
+	m.feedAlerts["_test"] = append(m.feedAlerts["_test"], alert)
+	m.rebuildMergedRealtimeLocked()
 }

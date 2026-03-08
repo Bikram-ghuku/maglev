@@ -55,6 +55,16 @@ func TestScheduleForRouteHandler(t *testing.T) {
 		require.True(t, ok)
 		require.NotEmpty(t, groupings)
 
+		// stops array should exist directly in the entry
+		stops, ok := entry["stops"].([]interface{})
+		require.True(t, ok, "stops should exist as an array in the entry")
+		assert.NotNil(t, stops)
+
+		// trips array should exist directly in the entry
+		trips, ok := entry["trips"].([]interface{})
+		require.True(t, ok, "trips should exist as an array in the entry")
+		assert.NotNil(t, trips)
+
 		firstGrouping, ok := groupings[0].(map[string]interface{})
 		require.True(t, ok)
 
@@ -103,16 +113,19 @@ func TestScheduleForRouteHandler(t *testing.T) {
 		require.True(t, ok)
 		require.NotEmpty(t, stopTimesRef)
 
-		// Validate a reference stopTime contains tripId and stopId combined IDs
+		// Validate a reference stopTime contains stopId combined IDs
 		firstRefST := stopTimesRef[0].(map[string]interface{})
+
 		refTid, ok := firstRefST["tripId"].(string)
-		require.True(t, ok)
-		require.Contains(t, refTid, "_")
+		require.True(t, ok, "tripId should be present and be a string")
+		require.Contains(t, refTid, "_", "tripId should be a combined ID")
+
 		refSid, ok := firstRefST["stopId"].(string)
-		require.True(t, ok)
-		require.Contains(t, refSid, "_")
+		require.True(t, ok, "stopId should be present and be a string")
+		require.Contains(t, refSid, "_", "stopId should be a combined ID")
+
 		_, hasArrival := firstRefST["arrivalTime"].(float64)
-		assert.True(t, hasArrival)
+		assert.True(t, hasArrival, "arrivalTime should be present")
 	})
 
 	t.Run("Invalid route", func(t *testing.T) {

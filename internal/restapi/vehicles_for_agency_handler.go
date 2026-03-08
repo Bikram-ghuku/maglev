@@ -14,10 +14,12 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 
 	ctx := r.Context()
 
+	// Acquire static lock only for the agency lookup; release immediately.
+	// VehiclesForAgencyID manages its own locking internally.
 	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
 	agency := api.GtfsManager.FindAgency(id)
+	api.GtfsManager.RUnlock()
+
 	if agency == nil {
 		// return an empty list response.
 		api.sendResponse(w, r, models.NewListResponse([]interface{}{}, models.ReferencesModel{}, false, api.Clock))
@@ -39,8 +41,8 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	routeIDs := make([]string, 0, len(routeIDSet))
-	for id := range routeIDSet {
-		routeIDs = append(routeIDs, id)
+	for routeID := range routeIDSet {
+		routeIDs = append(routeIDs, routeID)
 	}
 	routes, err := api.GtfsManager.GtfsDB.Queries.GetRoutesByIDs(ctx, routeIDs)
 	if err != nil {
@@ -48,17 +50,18 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	routeByID := make(map[string]gtfsdb.Route, len(routes))
-	for _, r := range routes {
-		routeByID[r.ID] = r
+	for _, route := range routes {
+		routeByID[route.ID] = route
 	}
 
 	// Maps to build references
 	agencyRefs := make(map[string]models.AgencyReference)
 	routeRefs := make(map[string]models.Route)
-	tripRefs := make(map[string]interface{})
+	tripRefs := make(map[string]models.Trip)
 
 	for _, vehicle := range vehiclesForAgency {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
@@ -68,8 +71,9 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 
 		// Set timestamps
 		if vehicle.Timestamp != nil {
-			vehicleStatus.LastLocationUpdateTime = vehicle.Timestamp.UnixNano() / int64(time.Millisecond)
-			vehicleStatus.LastUpdateTime = vehicle.Timestamp.UnixNano() / int64(time.Millisecond)
+			timestampMs := vehicle.Timestamp.UnixNano() / int64(time.Millisecond)
+			vehicleStatus.LastLocationUpdateTime = &timestampMs
+			vehicleStatus.LastUpdateTime = &timestampMs
 		}
 
 		// Set location if available
@@ -109,7 +113,7 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 				if obaOrientation < 0 {
 					obaOrientation += 360
 				}
-				tripStatus.Orientation = float32(obaOrientation)
+				tripStatus.Orientation = utils.Float64Ptr(float64(obaOrientation))
 			}
 
 			// Set service date (use current date for now)
@@ -118,9 +122,9 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 			vehicleStatus.TripStatus = tripStatus
 
 			// Add trip to references (basic trip reference)
-			tripRefs[vehicle.Trip.ID.ID] = map[string]interface{}{
-				"id":      vehicle.Trip.ID.ID,
-				"routeId": vehicle.Trip.ID.RouteID,
+			tripRefs[vehicle.Trip.ID.ID] = models.Trip{
+				ID:      utils.FormCombinedID(id, vehicle.Trip.ID.ID),
+				RouteID: utils.FormCombinedID(id, vehicle.Trip.ID.RouteID),
 			}
 
 			// Add route to references (from batch-fetched map)
@@ -174,12 +178,12 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 		agencyRefList = append(agencyRefList, agencyRef)
 	}
 
-	routeRefList := make([]interface{}, 0, len(routeRefs))
+	routeRefList := make([]models.Route, 0, len(routeRefs))
 	for _, routeRef := range routeRefs {
 		routeRefList = append(routeRefList, routeRef)
 	}
 
-	tripRefList := make([]interface{}, 0, len(tripRefs))
+	tripRefList := make([]models.Trip, 0, len(tripRefs))
 	for _, tripRef := range tripRefs {
 		tripRefList = append(tripRefList, tripRef)
 	}
@@ -187,8 +191,8 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 	references := models.ReferencesModel{
 		Agencies:   agencyRefList,
 		Routes:     routeRefList,
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
+		Situations: []models.Situation{},
+		StopTimes:  []models.RouteStopTime{},
 		Stops:      []models.Stop{},
 		Trips:      tripRefList,
 	}

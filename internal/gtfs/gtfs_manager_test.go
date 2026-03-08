@@ -2,7 +2,9 @@ package gtfs
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/OneBusAway/go-gtfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maglev.onebusaway.org/gtfsdb"
 	"maglev.onebusaway.org/internal/appconf"
 	"maglev.onebusaway.org/internal/models"
 )
@@ -48,6 +51,8 @@ func TestManager_RoutesForAgencyID(t *testing.T) {
 }
 
 func TestManager_GetStopsForLocation_UsesSpatialIndex(t *testing.T) {
+	ctx := context.Background()
+
 	testCases := []struct {
 		name          string
 		lat           float64
@@ -77,7 +82,7 @@ func TestManager_GetStopsForLocation_UsesSpatialIndex(t *testing.T) {
 			assert.NotNil(t, manager)
 
 			// Get stops using the manager method
-			stops := manager.GetStopsForLocation(context.Background(), tc.lat, tc.lon, tc.radius, 0, 0, "", 100, false, nil, time.Time{})
+			stops := manager.GetStopsForLocation(ctx, tc.lat, tc.lon, tc.radius, 0, 0, "", 100, false, nil, time.Time{})
 
 			// The test expects that the spatial index query is used
 			assert.GreaterOrEqual(t, len(stops), tc.expectedStops, "Should find stops within radius")
@@ -137,6 +142,29 @@ func TestManager_GetVehicleByID(t *testing.T) {
 	assert.Nil(t, notFound)
 }
 
+func TestGetVehicleForTrip_DirectTripIDLookup(t *testing.T) {
+	tripID := "trip-direct"
+	vehicleID := "v-direct"
+
+	manager := &Manager{
+		realTimeMutex: sync.RWMutex{},
+		feedVehicles: map[string][]gtfs.Vehicle{
+			"feed-0": {
+				{
+					ID:   &gtfs.VehicleID{ID: vehicleID},
+					Trip: &gtfs.Trip{ID: gtfs.TripID{ID: tripID}},
+				},
+			},
+		},
+	}
+	manager.rebuildMergedRealtimeLocked()
+
+	ctx := context.Background()
+	got := manager.GetVehicleForTrip(ctx, tripID)
+	require.NotNil(t, got)
+	assert.Equal(t, vehicleID, got.ID.ID)
+}
+
 func TestManager_GetTripUpdatesForTrip(t *testing.T) {
 	manager := &Manager{
 		realTimeTrips: []gtfs.Trip{
@@ -146,6 +174,10 @@ func TestManager_GetTripUpdatesForTrip(t *testing.T) {
 			{
 				ID: gtfs.TripID{ID: "trip2"},
 			},
+		},
+		realTimeTripLookup: map[string]int{
+			"trip1": 0,
+			"trip2": 1,
 		},
 	}
 
@@ -262,13 +294,15 @@ func TestManager_IsServiceActiveOnDate(t *testing.T) {
 }
 
 func TestManager_GetVehicleForTrip(t *testing.T) {
+	ctx := context.Background()
+
 	gtfsConfig := Config{
 		GtfsURL:      models.GetFixturePath(t, "raba.zip"),
 		GTFSDataPath: ":memory:",
 		Env:          appconf.Test,
 	}
 	// We use isolated GTFSManager here instead of shared test components because we want to control the real-time vehicles for this test.
-	manager, err := InitGTFSManager(gtfsConfig)
+	manager, err := InitGTFSManager(ctx, gtfsConfig)
 	assert.Nil(t, err)
 	defer manager.Shutdown()
 
@@ -293,7 +327,7 @@ func TestManager_GetVehicleForTrip(t *testing.T) {
 	}
 
 	// Test Not Found
-	nilVehicle := manager.GetVehicleForTrip(t.Context(), "nonexistent")
+	nilVehicle := manager.GetVehicleForTrip(context.Background(), "nonexistent")
 	assert.Nil(t, nilVehicle)
 }
 
@@ -363,12 +397,14 @@ func TestManager_FindRoute_UsesMap(t *testing.T) {
 }
 
 func TestRoutesForAgencyID_MapOptimization(t *testing.T) {
+	ctx := context.Background()
+
 	gtfsConfig := Config{
 		GtfsURL:      models.GetFixturePath(t, "raba.zip"),
 		GTFSDataPath: ":memory:",
 		Env:          appconf.Test,
 	}
-	manager, err := InitGTFSManager(gtfsConfig)
+	manager, err := InitGTFSManager(ctx, gtfsConfig)
 	require.NoError(t, err, "Failed to initialize manager")
 	defer manager.Shutdown()
 
@@ -398,12 +434,14 @@ func TestRoutesForAgencyID_MapOptimization(t *testing.T) {
 }
 
 func TestRoutesForAgencyID_ConcurrentAccess(t *testing.T) {
+	ctx := context.Background()
+
 	gtfsConfig := Config{
 		GtfsURL:      models.GetFixturePath(t, "raba.zip"),
 		GTFSDataPath: ":memory:",
 		Env:          appconf.Test,
 	}
-	manager, err := InitGTFSManager(gtfsConfig)
+	manager, err := InitGTFSManager(ctx, gtfsConfig)
 	require.NoError(t, err)
 	defer manager.Shutdown()
 
@@ -467,12 +505,14 @@ func TestRoutesForAgencyID_ConcurrentAccess(t *testing.T) {
 }
 
 func BenchmarkRoutesForAgencyID_MapLookup(b *testing.B) {
+	ctx := context.Background()
+
 	gtfsConfig := Config{
 		GtfsURL:      models.GetFixturePath(b, "raba.zip"),
 		GTFSDataPath: ":memory:",
 		Env:          appconf.Test,
 	}
-	manager, err := InitGTFSManager(gtfsConfig)
+	manager, err := InitGTFSManager(ctx, gtfsConfig)
 	if err != nil {
 		b.Fatalf("Failed to initialize: %v", err)
 	}
@@ -485,4 +525,78 @@ func BenchmarkRoutesForAgencyID_MapLookup(b *testing.B) {
 		_ = manager.RoutesForAgencyID("25")
 		manager.RUnlock()
 	}
+}
+
+func TestInitGTFSManager_RetryLogic(t *testing.T) {
+	ctx := context.Background()
+
+	// Use an ultra-fast backoff schedule for the test to prevent it from hanging
+	backoffs := []time.Duration{
+		1 * time.Millisecond,
+		2 * time.Millisecond,
+		3 * time.Millisecond,
+	}
+
+	config := Config{
+		// Use a clearly invalid URL that will trigger failures
+		GtfsURL:        "http://invalid.url.that.will.fail.internal/gtfs.zip",
+		GTFSDataPath:   ":memory:",
+		Env:            appconf.Test,
+		StartupRetries: backoffs, // Inject test backoffs
+	}
+
+	start := time.Now()
+
+	manager, err := InitGTFSManager(ctx, config)
+
+	// It should eventually fail after trying all backoffs
+	require.Error(t, err)
+	require.Nil(t, manager)
+
+	// Verify the entire process was fast (proving it used our 1ms, 2ms, 3ms backoffs)
+	duration := time.Since(start)
+	assert.Less(t, duration, 10*time.Second, "Retry logic should respect the configured backoff schedule")
+}
+
+func TestParseAndLogFeedExpiryLocked(t *testing.T) {
+	ctx := context.Background()
+
+	// In-memory sqlite db to mock
+	db, err := sql.Open(gtfsdb.DriverName, ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE calendar (end_date TEXT); CREATE TABLE calendar_dates (date TEXT, exception_type INTEGER);")
+	require.NoError(t, err)
+
+	manager := &Manager{
+		GtfsDB: &gtfsdb.Client{
+			DB:      db,
+			Queries: gtfsdb.New(db),
+		},
+	}
+
+	// 1. Empty calendar
+	// Set an initial value to prove it gets reset
+	manager.feedExpiresAt = time.Now()
+	manager.parseAndLogFeedExpiryLocked(ctx, slog.Default())
+	assert.True(t, manager.feedExpiresAt.IsZero(), "Should be zero when no dates exist")
+
+	// 2. Insert valid end date into calendar
+	_, err = db.Exec("INSERT INTO calendar (end_date) VALUES ('20260401')")
+	require.NoError(t, err)
+
+	manager.parseAndLogFeedExpiryLocked(ctx, slog.Default())
+	assert.False(t, manager.feedExpiresAt.IsZero(), "Should parse end date")
+
+	// Valid end date should be 2026-04-01 23:59:59
+	expectedTime, _ := time.Parse("20060102150405", "20260401235959")
+	assert.Equal(t, expectedTime.Unix(), manager.feedExpiresAt.Unix())
+
+	// 3. Hot-swap scenario: Clear calendar (feed expires at should reset to zero)
+	_, err = db.Exec("DELETE FROM calendar")
+	require.NoError(t, err)
+
+	manager.parseAndLogFeedExpiryLocked(ctx, slog.Default())
+	assert.True(t, manager.feedExpiresAt.IsZero(), "Should reset to zero after hot swap to empty feed")
 }

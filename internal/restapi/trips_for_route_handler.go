@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/OneBusAway/go-gtfs"
@@ -124,6 +125,7 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 
 	for blockID := range allLinkedBlocks {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
@@ -141,8 +143,7 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 		activeTrip, err := api.GtfsManager.GtfsDB.Queries.GetActiveTripInBlockAtTime(ctx, gtfsdb.GetActiveTripInBlockAtTimeParams{
 			BlockID:     blockIDNullStr,
 			ServiceIds:  serviceIDs,
-			CurrentTime: currentNanosSinceMidnight,
-		})
+			CurrentTime: sql.NullInt64{Int64: currentNanosSinceMidnight, Valid: true}})
 		if err != nil {
 			continue
 		}
@@ -225,6 +226,7 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 	var result []models.TripsForRouteListEntry
 	for _, activeEntry := range activeTrips {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
@@ -360,7 +362,7 @@ func buildTripReferences[T interface{ GetTripId() string }](
 				ServiceID:     trip.ServiceID,
 				TripHeadsign:  trip.TripHeadsign.String,
 				TripShortName: trip.TripShortName.String,
-				DirectionID:   trip.DirectionID.Int64,
+				DirectionID:   strconv.FormatInt(trip.DirectionID.Int64, 10),
 				BlockID:       trip.BlockID.String,
 				ShapeID:       trip.ShapeID.String,
 				PeakOffPeak:   0,
@@ -449,7 +451,7 @@ func buildTripReferences[T interface{ GetTripId() string }](
 		})
 	}
 
-	tripsRefList := make([]interface{}, 0, len(presentTrips))
+	tripsRefList := make([]models.Trip, 0, len(presentTrips))
 	if includeTrip {
 		for _, trip := range presentTrips {
 			// Ensure we have the route to get the Agency ID
@@ -472,7 +474,7 @@ func buildTripReferences[T interface{ GetTripId() string }](
 	}
 
 	// Convert maps to slices for response
-	routes := make([]interface{}, 0, len(presentRoutes))
+	routes := make([]models.Route, 0, len(presentRoutes))
 	for _, route := range presentRoutes {
 		if route.ID != "" {
 			routes = append(routes, route)
@@ -487,8 +489,8 @@ func buildTripReferences[T interface{ GetTripId() string }](
 	return models.ReferencesModel{
 		Agencies:   agencyList,
 		Routes:     routes,
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
+		Situations: []models.Situation{},
+		StopTimes:  []models.RouteStopTime{},
 		Stops:      stopList,
 		Trips:      tripsRefList,
 	}

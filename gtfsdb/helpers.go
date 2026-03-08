@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/OneBusAway/go-gtfs"
-	_ "github.com/mattn/go-sqlite3" // CGo-based SQLite driver
 	"maglev.onebusaway.org/internal/appconf"
 	"maglev.onebusaway.org/internal/logging"
 )
@@ -30,7 +29,7 @@ func createDB(config Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("test database must use in-memory storage, got path: %s", config.DBPath)
 	}
 
-	db, err := sql.Open("sqlite3", config.DBPath)
+	db, err := sql.Open(DriverName, config.DBPath)
 	if err != nil {
 		return nil, err
 	}
@@ -87,16 +86,38 @@ func (c *Client) processAndStoreGTFSDataWithSource(b []byte, source string) erro
 
 	ctx := context.Background()
 
-	// Check if we already have this data imported
+	// 1. Check if we already have this data imported
+	var hasExisting bool
 	existingMetadata, err := c.Queries.GetImportMetadata(ctx)
 	if err == nil {
+		hasExisting = true
 		// We have existing metadata, check if hash matches
 		if existingMetadata.FileHash == hashStr && existingMetadata.FileSource == source {
 			logging.LogOperation(logger, "gtfs_data_unchanged_skipping_import",
 				slog.String("hash", hashStr[:8]))
 			return nil
 		}
-		// Hash differs, we need to clear existing data and reimport
+	} else if err != nil && err != sql.ErrNoRows {
+		// Some other error occurred
+		return fmt.Errorf("error checking import metadata: %w", err)
+	}
+
+	// 2. Parse the new data FIRST (before deleting the old working data)
+	staticData, err := gtfs.ParseStatic(b, gtfs.ParseStaticOptions{})
+	if err != nil {
+		return err
+	}
+
+	// 3. Perform Structural Validation
+	if err := ValidateGTFSData(staticData); err != nil {
+		logging.LogError(logger, "GTFS feed structural validation failed", err)
+		return fmt.Errorf("GTFS validation failed: %w", err)
+	}
+
+	logging.LogOperation(logger, "retrieved_static_data", slog.Int("warnings", len(staticData.Warnings)))
+
+	// 4. Clear the old data now that we know the new data is completely valid
+	if hasExisting {
 		logging.LogOperation(logger, "gtfs_data_changed_reimporting",
 			slog.String("old_hash", existingMetadata.FileHash[:8]),
 			slog.String("new_hash", hashStr[:8]))
@@ -104,22 +125,9 @@ func (c *Client) processAndStoreGTFSDataWithSource(b []byte, source string) erro
 		if err != nil {
 			return fmt.Errorf("error clearing existing GTFS data: %w", err)
 		}
-	} else if err != nil && err != sql.ErrNoRows {
-		// Some other error occurred
-		return fmt.Errorf("error checking import metadata: %w", err)
-	}
-	// If err == sql.ErrNoRows, this is the first import, continue normally
-
-	var staticCounts map[string]int
-
-	staticData, err := gtfs.ParseStatic(b, gtfs.ParseStaticOptions{})
-	if err != nil {
-		return err
 	}
 
-	logging.LogOperation(logger, "retrieved_static_data", slog.Int("warnings", len(staticData.Warnings)))
-
-	staticCounts = c.staticDataCounts(staticData)
+	staticCounts := c.staticDataCounts(staticData)
 	for k, v := range staticCounts {
 		logging.LogOperation(logger, "static_data_count", slog.String("entity_type", k), slog.Int("count", v))
 	}
@@ -298,6 +306,27 @@ func (c *Client) processAndStoreGTFSDataWithSource(b []byte, source string) erro
 		return fmt.Errorf("unable to create stop times: %w", err)
 	}
 
+	// Collect frequency entries from all trips
+	var allFrequencyParams []CreateFrequencyParams
+	for _, t := range staticData.Trips {
+		for _, f := range t.Frequencies {
+			params := CreateFrequencyParams{
+				TripID:      t.ID,
+				StartTime:   int64(f.StartTime),
+				EndTime:     int64(f.EndTime),
+				HeadwaySecs: int64(f.Headway.Seconds()),
+				ExactTimes:  int64(f.ExactTimes),
+			}
+			allFrequencyParams = append(allFrequencyParams, params)
+		}
+	}
+	if len(allFrequencyParams) > 0 {
+		err = c.bulkInsertFrequencies(ctx, allFrequencyParams)
+		if err != nil {
+			return fmt.Errorf("unable to create frequencies: %w", err)
+		}
+	}
+
 	var allShapeParams []CreateShapeParams
 	for _, s := range staticData.Shapes {
 		for idx, pt := range s.Points {
@@ -399,6 +428,9 @@ func (c *Client) clearAllGTFSData(ctx context.Context) error {
 	}
 	if err := c.Queries.ClearBlockTripIndices(ctx); err != nil {
 		return fmt.Errorf("error clearing block_trip_index: %w", err)
+	}
+	if err := c.Queries.ClearFrequencies(ctx); err != nil {
+		return fmt.Errorf("error clearing frequencies: %w", err)
 	}
 	if err := c.Queries.ClearStopTimes(ctx); err != nil {
 		return fmt.Errorf("error clearing stop_times: %w", err)
@@ -583,7 +615,8 @@ func (c *Client) bulkInsertStopTimes(ctx context.Context, stopTimes []CreateStop
 		slog.Int("count", len(stopTimes)))
 
 	// ===== PIPELINE: PARALLEL PREPARATION + SEQUENTIAL EXECUTION =====
-	batchSize := c.config.SafeBatchSize(10) // 10 fields per stop_time row
+	const stopTimeFieldsPerRow = 10 // 10 fields per stop_time row
+	batchSize := c.config.SafeBatchSize(stopTimeFieldsPerRow)
 	const baseQuery = `INSERT INTO stop_times (
 		trip_id, arrival_time, departure_time, stop_id, stop_sequence,
 		stop_headsign, pickup_type, drop_off_type, shape_dist_traveled, timepoint
@@ -631,7 +664,7 @@ func (c *Client) bulkInsertStopTimes(ctx context.Context, stopTimes []CreateStop
 				// into the query string to prevent SQL injection attacks.
 				var query strings.Builder
 				query.WriteString(baseQuery)
-				args := make([]interface{}, 0, len(batch)*10)
+				args := make([]interface{}, 0, len(batch)*stopTimeFieldsPerRow)
 
 				for j, params := range batch {
 					if j > 0 {
@@ -753,7 +786,8 @@ func (c *Client) bulkInsertShapes(ctx context.Context, shapes []CreateShapeParam
 		slog.Int("count", len(shapes)))
 
 	// ===== PHASE 1: PARALLEL STATEMENT PREPARATION =====
-	batchSize := c.config.SafeBatchSize(5) // 5 fields per shape row
+	const shapeFieldsPerRow = 5 // 5 fields per shape row
+	batchSize := c.config.SafeBatchSize(shapeFieldsPerRow)
 	const baseQuery = `INSERT INTO shapes (
 		shape_id, lat, lon, shape_pt_sequence, shape_dist_traveled
 	) VALUES `
@@ -793,7 +827,7 @@ func (c *Client) bulkInsertShapes(ctx context.Context, shapes []CreateShapeParam
 				// into the query string to prevent SQL injection attacks.
 				var query strings.Builder
 				query.WriteString(baseQuery)
-				args := make([]interface{}, 0, len(batch)*5)
+				args := make([]interface{}, 0, len(batch)*shapeFieldsPerRow)
 
 				for j, params := range batch {
 					if j > 0 {
@@ -846,7 +880,7 @@ func (c *Client) bulkInsertShapes(ctx context.Context, shapes []CreateShapeParam
 	for batch := range resultsChan {
 		preparedBatches = append(preparedBatches, batch)
 
-		// Log preparation progress every 50 batches (150k records with batch size 3000)
+		// Log preparation progress every 50 batches (~327k records with batch size 6553)
 		if len(preparedBatches)-lastLoggedCount >= 50 {
 			logging.LogOperation(logger, "shapes_preparation_progress",
 				slog.Int("batches_prepared", len(preparedBatches)),
@@ -902,6 +936,38 @@ func (c *Client) bulkInsertShapes(ctx context.Context, shapes []CreateShapeParam
 
 	logging.LogOperation(logger, "shapes_inserted",
 		slog.Int("count", len(shapes)))
+
+	return nil
+}
+
+func (c *Client) bulkInsertFrequencies(ctx context.Context, frequencies []CreateFrequencyParams) error {
+	db := c.DB
+	queries := c.Queries
+	logger := slog.Default().With(slog.String("component", "bulk_insert"))
+
+	logging.LogOperation(logger, "inserting_frequencies",
+		slog.Int("count", len(frequencies)))
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer logging.SafeRollbackWithLogging(tx, logger, "bulk_insert_frequencies")
+
+	qtx := queries.WithTx(tx)
+	for _, params := range frequencies {
+		err := qtx.CreateFrequency(ctx, params)
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	logging.LogOperation(logger, "frequencies_inserted",
+		slog.Int("count", len(frequencies)))
 
 	return nil
 }
@@ -1106,5 +1172,71 @@ func (c *Client) buildBlockTripIndex(ctx context.Context, staticData *gtfs.Stati
 		slog.Int("indices_created", len(indexGroups)),
 		slog.Int("entries_created", totalEntries))
 
+	return nil
+}
+
+// ValidateGTFSData performs structural validation on the parsed GTFS data before import.
+// It ensures that required files are present and basic foreign-key relationships hold true.
+func ValidateGTFSData(data *gtfs.Static) error {
+	if data == nil {
+		return fmt.Errorf("parsed GTFS data is nil")
+	}
+
+	// Check for required baseline entities
+	if len(data.Agencies) == 0 {
+		return fmt.Errorf("validation failed: no agencies found in feed (missing or empty agency.txt)")
+	}
+	if len(data.Routes) == 0 {
+		return fmt.Errorf("validation failed: no routes found in feed (missing or empty routes.txt)")
+	}
+	if len(data.Stops) == 0 {
+		return fmt.Errorf("validation failed: no stops found in feed (missing or empty stops.txt)")
+	}
+	if len(data.Trips) == 0 {
+		return fmt.Errorf("validation failed: no trips found in feed (missing or empty trips.txt)")
+	}
+
+	// Check for service information (Calendar or CalendarDates)
+	hasService := false
+	for _, service := range data.Services {
+		// Check for calendar.txt regular service
+		if service.Monday || service.Tuesday || service.Wednesday || service.Thursday || service.Friday || service.Saturday || service.Sunday {
+			hasService = true
+			break
+		}
+		// Check for calendar_dates.txt exception service
+		if len(service.AddedDates) > 0 || len(service.RemovedDates) > 0 {
+			hasService = true
+			break
+		}
+	}
+	if !hasService {
+		return fmt.Errorf("validation failed: no service calendars or calendar_dates found")
+	}
+
+	// Foreign Key / Relationship Checks
+	for _, trip := range data.Trips {
+		// Ensure the trip points to a valid route
+		if trip.Route == nil || trip.Route.Id == "" {
+			return fmt.Errorf("validation failed: trip %s references missing or invalid route", trip.ID)
+		}
+
+		// Ensure the trip points to a valid service (Fixes #3)
+		if trip.Service == nil || trip.Service.Id == "" {
+			return fmt.Errorf("validation failed: trip %s references missing or invalid service", trip.ID)
+		}
+
+		// Ensure the trip has stop times
+		if len(trip.StopTimes) == 0 {
+			return fmt.Errorf("validation failed: trip %s has no stop times", trip.ID)
+		}
+
+		// Ensure stop times reference valid stops
+		for _, st := range trip.StopTimes {
+			if st.Stop == nil || st.Stop.Id == "" {
+				return fmt.Errorf("validation failed: stop time for trip %s references missing stop", trip.ID)
+			}
+		}
+	}
 	return nil
 }

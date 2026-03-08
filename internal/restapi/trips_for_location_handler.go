@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/OneBusAway/go-gtfs"
@@ -30,6 +31,12 @@ func (api *RestAPI) tripsForLocationHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Intentionally defaulting includeStatus to false to align with includeSchedule
+	// behavior for this endpoint, even though trips-for-route defaults to true.
+	includeStatus := r.URL.Query().Get("includeStatus") == "true"
+	// Note: re-deriving currentTime here rather than returning it from parseAndValidateRequest(line: 150)
+	currentTime := api.Clock.Now().In(currentLocation)
+
 	stops := api.GtfsManager.GetStopsForLocation(ctx, lat, lon, -1, latSpan, lonSpan, "", 100, false, []int{}, api.Clock.Now())
 	stopIDs := extractStopIDs(stops)
 	stopTimes, err := api.GtfsManager.GtfsDB.Queries.GetStopTimesByStopIDs(ctx, stopIDs)
@@ -44,6 +51,7 @@ func (api *RestAPI) tripsForLocationHandler(w http.ResponseWriter, r *http.Reque
 	visibleTripIDs := make([]string, 0, len(activeTrips))
 	for _, vehicle := range activeTrips {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
@@ -94,12 +102,13 @@ func (api *RestAPI) tripsForLocationHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Build entries from pre-fetched trip data
-	result := api.buildTripsForLocationEntries(ctx, trips, tripAgencyMap, includeSchedule, currentLocation, todayMidnight, serviceDate, w, r)
+	result := api.buildTripsForLocationEntries(ctx, trips, tripAgencyMap, includeSchedule, includeStatus, currentLocation, currentTime, todayMidnight, serviceDate, w, r)
 	if result == nil {
 		return
 	}
 
 	if ctx.Err() != nil {
+		api.clientCanceledResponse(w, r, ctx.Err())
 		return
 	}
 
@@ -123,8 +132,8 @@ func (api *RestAPI) parseAndValidateRequest(r *http.Request) (
 ) {
 	queryParams := r.URL.Query()
 
-	lat, fieldErrors = utils.ParseFloatParam(queryParams, "lat", nil)
-	lon, _ = utils.ParseFloatParam(queryParams, "lon", fieldErrors)
+	lat, fieldErrors = utils.ParseRequiredFloatParam(queryParams, "lat", nil)
+	lon, _ = utils.ParseRequiredFloatParam(queryParams, "lon", fieldErrors)
 	latSpan, _ = utils.ParseFloatParam(queryParams, "latSpan", fieldErrors)
 	lonSpan, _ = utils.ParseFloatParam(queryParams, "lonSpan", fieldErrors)
 	includeTrip = queryParams.Get("includeTrip") == "true"
@@ -142,7 +151,12 @@ func (api *RestAPI) parseAndValidateRequest(r *http.Request) (
 	currentTime := api.Clock.Now().In(currentLocation)
 	todayMidnight = time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), 0, 0, 0, 0, currentLocation)
 
-	_, serviceDate, fieldErrors, success := utils.ParseTimeParameter(timeParam, currentLocation)
+	var timeFieldErrors map[string][]string
+	var success bool
+	_, serviceDate, timeFieldErrors, success = utils.ParseTimeParameter(timeParam, currentLocation)
+	for k, v := range timeFieldErrors {
+		fieldErrors[k] = append(fieldErrors[k], v...)
+	}
 
 	ctx := r.Context()
 	if ctx.Err() != nil {
@@ -156,14 +170,8 @@ func (api *RestAPI) parseAndValidateRequest(r *http.Request) (
 	}
 
 	locationErrors := utils.ValidateLocationParams(lat, lon, 0, latSpan, lonSpan)
-	if len(locationErrors) > 0 {
-		if fieldErrors == nil {
-			fieldErrors = locationErrors
-		} else {
-			for k, v := range locationErrors {
-				fieldErrors[k] = append(fieldErrors[k], v...)
-			}
-		}
+	for k, v := range locationErrors {
+		fieldErrors[k] = append(fieldErrors[k], v...)
 	}
 
 	if len(fieldErrors) > 0 {
@@ -213,7 +221,9 @@ func (api *RestAPI) buildTripsForLocationEntries(
 	trips []gtfsdb.Trip,
 	tripAgencyMap map[string]string,
 	includeSchedule bool,
+	includeStatus bool,
 	currentLocation *time.Location,
+	currentTime time.Time,
 	todayMidnight time.Time,
 	serviceDate time.Time,
 	w http.ResponseWriter,
@@ -260,7 +270,7 @@ func (api *RestAPI) buildTripsForLocationEntries(
 	}
 
 	stopTimesMap := make(map[string][]gtfsdb.StopTime)
-	blockTripsMap := make(map[string][]gtfsdb.Trip)
+	blockTripsMap := make(map[string][]gtfsdb.GetTripsByBlockIDsRow)
 	var allStopIDs []string
 
 	if includeSchedule {
@@ -337,13 +347,15 @@ func (api *RestAPI) buildTripsForLocationEntries(
 		}
 
 		var schedule *models.TripsSchedule
+		var status *models.TripStatusForTripDetails
+
 		if includeSchedule {
 			var shapePoints []gtfs.ShapePoint
 			if tripData.ShapeID.Valid {
 				shapePoints = shapesMap[tripData.ShapeID.String]
 			}
 
-			var blockTrips []gtfsdb.Trip
+			var blockTrips []gtfsdb.GetTripsByBlockIDsRow
 			if tripData.BlockID.Valid {
 				blockTrips = blockTripsMap[tripData.BlockID.String]
 			}
@@ -358,9 +370,20 @@ func (api *RestAPI) buildTripsForLocationEntries(
 				blockTrips,
 			)
 		}
+
+		if includeStatus {
+			var statusErr error
+			status, statusErr = api.BuildTripStatus(ctx, agencyID, tripID, todayMidnight, currentTime)
+			if statusErr != nil {
+				api.Logger.Warn("BuildTripStatus failed", "tripID", tripID, "error", statusErr)
+				status = nil
+			}
+		}
+
 		entry := models.TripsForLocationListEntry{
 			Frequency:    nil,
 			Schedule:     schedule,
+			Status:       status,
 			ServiceDate:  todayMidnight.UnixMilli(),
 			SituationIds: api.GetSituationIDsForTrip(ctx, tripID),
 			TripId:       utils.FormCombinedID(agencyID, tripID),
@@ -462,7 +485,7 @@ type referenceBuilder struct {
 	presentRoutes   map[string]models.Route
 	presentAgencies map[string]models.AgencyReference
 	stopList        []models.Stop
-	tripsRefList    []interface{}
+	tripsRefList    []models.Trip
 }
 
 func (rb *referenceBuilder) build(params ReferenceParams) error {
@@ -487,7 +510,7 @@ func (rb *referenceBuilder) build(params ReferenceParams) error {
 func (rb *referenceBuilder) collectTripIDs(trips []models.TripsForLocationListEntry) {
 	for _, trip := range trips {
 		_, tripID, err := utils.ExtractAgencyIDAndCodeID(trip.TripId)
-		if err != nil {
+		if err == nil {
 			rb.presentTrips[tripID] = models.Trip{}
 		}
 
@@ -499,6 +522,13 @@ func (rb *referenceBuilder) collectTripIDs(trips []models.TripsForLocationListEn
 				rb.presentTrips[prevID] = models.Trip{}
 			}
 		}
+
+		if trip.Status != nil && trip.Status.ActiveTripID != "" {
+			if _, activeID, err := utils.ExtractAgencyIDAndCodeID(trip.Status.ActiveTripID); err == nil {
+				rb.presentTrips[activeID] = models.Trip{}
+			}
+		}
+
 	}
 }
 
@@ -599,7 +629,7 @@ func (rb *referenceBuilder) createTrip(trip gtfsdb.Trip) models.Trip {
 		ServiceID:     trip.ServiceID,
 		TripHeadsign:  trip.TripHeadsign.String,
 		TripShortName: trip.TripShortName.String,
-		DirectionID:   trip.DirectionID.Int64,
+		DirectionID:   strconv.FormatInt(trip.DirectionID.Int64, 10),
 		BlockID:       trip.BlockID.String,
 		ShapeID:       trip.ShapeID.String,
 		PeakOffPeak:   0,
@@ -669,7 +699,7 @@ func (rb *referenceBuilder) addAgency(agencyID string) error {
 }
 
 func (rb *referenceBuilder) buildTripReferences() error {
-	rb.tripsRefList = make([]interface{}, 0, len(rb.presentTrips))
+	rb.tripsRefList = make([]models.Trip, 0, len(rb.presentTrips))
 
 	for _, trip := range rb.presentTrips {
 		if rb.ctx.Err() != nil {
@@ -694,7 +724,7 @@ func (rb *referenceBuilder) createTripReference(tripDetails gtfsdb.Trip, current
 		ServiceID:     utils.FormCombinedID(currentAgency, trip.ServiceID),
 		TripHeadsign:  tripDetails.TripHeadsign.String,
 		TripShortName: tripDetails.TripShortName.String,
-		DirectionID:   tripDetails.DirectionID.Int64,
+		DirectionID:   strconv.FormatInt(tripDetails.DirectionID.Int64, 10),
 		BlockID:       utils.FormCombinedID(currentAgency, trip.BlockID),
 		ShapeID:       utils.FormCombinedID(currentAgency, tripDetails.ShapeID.String),
 		PeakOffPeak:   0,
@@ -706,8 +736,8 @@ func (rb *referenceBuilder) toReferencesModel() models.ReferencesModel {
 	return models.ReferencesModel{
 		Agencies:   rb.getAgenciesList(),
 		Routes:     rb.getRoutesList(),
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
+		Situations: []models.Situation{},
+		StopTimes:  []models.RouteStopTime{},
 		Stops:      rb.stopList,
 		Trips:      rb.tripsRefList,
 	}
@@ -721,8 +751,8 @@ func (rb *referenceBuilder) getAgenciesList() []models.AgencyReference {
 	return agencies
 }
 
-func (rb *referenceBuilder) getRoutesList() []interface{} {
-	routes := make([]interface{}, 0, len(rb.presentRoutes))
+func (rb *referenceBuilder) getRoutesList() []models.Route {
+	routes := make([]models.Route, 0, len(rb.presentRoutes))
 	for _, route := range rb.presentRoutes {
 		if route.ID != "" {
 			routes = append(routes, route)
@@ -739,7 +769,7 @@ func (api *RestAPI) buildScheduleFromMemory(
 	stopTimes []gtfsdb.StopTime,
 	shapePoints []gtfs.ShapePoint,
 	stopCoords map[string]struct{ lat, lon float64 },
-	blockTrips []gtfsdb.Trip,
+	blockTrips []gtfsdb.GetTripsByBlockIDsRow,
 ) *models.TripsSchedule {
 
 	// Calculate Next/Prev using in-memory block trips
@@ -758,14 +788,14 @@ func (api *RestAPI) buildScheduleFromMemory(
 }
 
 // calculateNextPrevFromMemory determines the next and previous trip IDs within a block.
-func (api *RestAPI) calculateNextPrevFromMemory(currentTrip gtfsdb.Trip, blockTrips []gtfsdb.Trip, agencyID string) (string, string) {
+func (api *RestAPI) calculateNextPrevFromMemory(currentTrip gtfsdb.Trip, blockTrips []gtfsdb.GetTripsByBlockIDsRow, agencyID string) (string, string) {
 	if len(blockTrips) == 0 {
 		return "", ""
 	}
 
 	// Filter blockTrips to only include those that share the exact ServiceID of the current trip.
 	// This ensures we don't mix trips from different service days (e.g. Weekday vs Weekend).
-	var relevantTrips []gtfsdb.Trip
+	var relevantTrips []gtfsdb.GetTripsByBlockIDsRow
 	for _, t := range blockTrips {
 		if t.ServiceID == currentTrip.ServiceID {
 			relevantTrips = append(relevantTrips, t)

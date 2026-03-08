@@ -3,6 +3,7 @@ package gtfs
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"math"
 	"sort"
@@ -28,6 +29,7 @@ type AdvancedDirectionCalculator struct {
 	shapeCache                 map[string][]gtfsdb.GetShapePointsWithDistanceRow // Cache of all shape data for bulk operations
 	initialized                atomic.Bool                                       // Tracks whether concurrent operations have started
 	cacheMutex                 sync.RWMutex                                      // Protects map access
+	directionResults           sync.Map                                          // Cached direction results (stopID -> string), includes negative cache
 }
 
 // NewAdvancedDirectionCalculator creates a new advanced direction calculator
@@ -40,40 +42,45 @@ func NewAdvancedDirectionCalculator(queries *gtfsdb.Queries) *AdvancedDirectionC
 
 // SetStandardDeviationThreshold sets the standard deviation threshold for direction variance checking.
 // IMPORTANT: This must be called before any concurrent operations begin.
-// Panics if called after CalculateStopDirection has been invoked.
-func (adc *AdvancedDirectionCalculator) SetStandardDeviationThreshold(threshold float64) {
+// Returns an error if called after CalculateStopDirection has been invoked.
+func (adc *AdvancedDirectionCalculator) SetStandardDeviationThreshold(threshold float64) error {
 	if adc.initialized.Load() {
-		panic("SetStandardDeviationThreshold called after concurrent operations have started")
+		return errors.New("SetStandardDeviationThreshold called after concurrent operations have started")
+	}
+	if threshold <= 0 {
+		return errors.New("standard deviation threshold must be greater than zero")
 	}
 	adc.standardDeviationThreshold = threshold
+	return nil
 }
 
 // SetShapeCache sets a pre-loaded cache of shape data to avoid database queries during bulk operations.
 // This significantly improves performance when calculating directions for many stops.
 // IMPORTANT: This must be called before any concurrent operations begin.
-// Panics if called after CalculateStopDirection has been invoked.
-func (adc *AdvancedDirectionCalculator) SetShapeCache(cache map[string][]gtfsdb.GetShapePointsWithDistanceRow) {
+// Returns an error if called after CalculateStopDirection has been invoked.
+func (adc *AdvancedDirectionCalculator) SetShapeCache(cache map[string][]gtfsdb.GetShapePointsWithDistanceRow) error {
 	adc.cacheMutex.Lock()
 	defer adc.cacheMutex.Unlock()
 
 	if adc.initialized.Load() {
-		panic("SetShapeCache called after concurrent operations have started")
+		return errors.New("SetShapeCache called after concurrent operations have started")
 	}
 	adc.shapeCache = cache
+	return nil
 }
 
 // SetContextCache injects the bulk-loaded context data.
 // IMPORTANT: This must be called before any concurrent calculation operations begin.
-// Panics if called after internal state has been initialized (i.e., after the first
-// fallback to shape-based calculation).
-func (adc *AdvancedDirectionCalculator) SetContextCache(cache map[string][]gtfsdb.GetStopsWithShapeContextRow) {
+// Returns an error if called after CalculateStopDirection has been invoked.
+func (adc *AdvancedDirectionCalculator) SetContextCache(cache map[string][]gtfsdb.GetStopsWithShapeContextRow) error {
 	adc.cacheMutex.Lock()
 	defer adc.cacheMutex.Unlock()
 
 	if adc.initialized.Load() {
-		panic("SetContextCache called after concurrent operations have started")
+		return errors.New("SetContextCache called after concurrent operations have started")
 	}
 	adc.contextCache = cache
+	return nil
 }
 
 // CalculateStopDirection computes the direction for a stop using the Java algorithm
@@ -84,33 +91,43 @@ func (adc *AdvancedDirectionCalculator) CalculateStopDirection(ctx context.Conte
 		}
 	}
 
+	// Check the in-memory result cache (includes negative cache for empty results)
+	if cached, ok := adc.directionResults.Load(stopID); ok {
+		return cached.(string)
+	}
+
 	// Mark as initialized for concurrency safety
 	adc.initialized.Store(true)
 
-	return adc.computeFromShapes(ctx, stopID)
+	result := adc.computeFromShapes(ctx, stopID)
+
+	// Cache the result (even empty strings) to avoid recomputation
+	adc.directionResults.Store(stopID, result)
+
+	return result
 }
 
 // translateGtfsDirection converts GTFS direction field to compass direction
 func (adc *AdvancedDirectionCalculator) translateGtfsDirection(direction string) string {
 	direction = strings.TrimSpace(strings.ToLower(direction))
 
-	// Try text-based directions
+	// Try text-based directions and compass abbreviations
 	switch direction {
-	case "north":
+	case "north", "n":
 		return "N"
-	case "northeast":
+	case "northeast", "ne":
 		return "NE"
-	case "east":
+	case "east", "e":
 		return "E"
-	case "southeast":
+	case "southeast", "se":
 		return "SE"
-	case "south":
+	case "south", "s":
 		return "S"
-	case "southwest":
+	case "southwest", "sw":
 		return "SW"
-	case "west":
+	case "west", "w":
 		return "W"
-	case "northwest":
+	case "northwest", "nw":
 		return "NW"
 	}
 

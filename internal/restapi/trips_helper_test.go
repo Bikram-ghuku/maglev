@@ -590,7 +590,8 @@ func TestBuildTripStatus_ScheduleDeviation_SetsPredicted(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, status)
 
-	assert.Equal(t, 120, status.ScheduleDeviation, "ScheduleDeviation should reflect the trip update delay")
+	require.NotNil(t, status.ScheduleDeviation)
+	assert.Equal(t, 120, *status.ScheduleDeviation, "ScheduleDeviation should reflect the trip update delay")
 	assert.True(t, status.Predicted, "Predicted should be true when trip update exists")
 	assert.False(t, status.Scheduled, "Scheduled should be false when predicted is true")
 }
@@ -617,7 +618,7 @@ func TestBuildTripStatus_NoRealtimeData_SetsScheduled(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, status)
 
-	assert.Equal(t, 0, status.ScheduleDeviation, "ScheduleDeviation should be 0 with no real-time data")
+	assert.Nil(t, status.ScheduleDeviation, "ScheduleDeviation should be nil with no real-time data")
 	assert.False(t, status.Predicted, "Predicted should be false with no real-time data")
 	assert.True(t, status.Scheduled, "Scheduled should be true with no real-time data")
 	assert.Equal(t, "default", status.Status)
@@ -681,10 +682,11 @@ func TestBuildTripStatus_ShapeData_ComputesDistanceAlongTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, status)
 
-	assert.Greater(t, status.TotalDistanceAlongTrip, 0.0, "TotalDistanceAlongTrip should be > 0 with shape data")
-	assert.Greater(t, status.DistanceAlongTrip, 0.0, "DistanceAlongTrip should be > 0 for a vehicle mid-route")
-	assert.Less(t, status.DistanceAlongTrip, status.TotalDistanceAlongTrip,
-		"DistanceAlongTrip should be less than total for a mid-route vehicle")
+	require.NotNil(t, status.TotalDistanceAlongTrip)
+	require.NotNil(t, status.DistanceAlongTrip)
+	assert.Greater(t, *status.TotalDistanceAlongTrip, float64(0), "TotalDistanceAlongTrip should be > 0 with shape data")
+	assert.Greater(t, *status.DistanceAlongTrip, float64(0), "DistanceAlongTrip should be > 0 for a vehicle mid-route")
+	assert.Less(t, *status.DistanceAlongTrip, *status.TotalDistanceAlongTrip, "DistanceAlongTrip should be less than total for a mid-route vehicle")
 }
 
 func TestBuildTripStatus_VehicleIDFormat(t *testing.T) {
@@ -1725,3 +1727,216 @@ func TestGetFirstStopOfNextTripInBlock_WithBlockContinuation(t *testing.T) {
 	require.NotNil(t, result, "should find the first stop of the next block trip")
 	assert.NotEmpty(t, result.StopID, "returned stop should have a non-empty StopID")
 }
+
+// DST boundary tests
+//
+// These tests verify that closest-stop and next-stop calculations are correct
+// during Daylight Saving Time transitions, specifically the "fall back" case
+// where the same wall-clock time (e.g. 1:30 AM) occurs twice in one night.
+//
+// Root issue: GTFS stop_time values are plain wall-clock seconds since midnight.
+// CalculateSecondsSinceServiceDate must return matching wall-clock seconds, not
+// real elapsed seconds, otherwise the two values diverge by 3600 s during the
+// ambiguous DST hour.
+//
+// DST fallback reference (America/Los_Angeles, 2024-11-03):
+//
+//	Midnight PDT       = 2024-11-03 00:00 PDT  (Nov 3 07:00 UTC)
+//	First  1:30 AM PDT = 2024-11-03 01:30 PDT  (5 400 real s from midnight)
+//	Second 1:30 AM PST = 2024-11-03 01:30 PST  (9 000 real s from midnight — same wall-clock)
+//
+// Construct the second 1:30 AM by subtracting 30 min from unambiguous 2:00 AM PST:
+//
+//	twoAMAfterFallback := time.Date(2024, 11, 3, 2, 0, 0, 0, la)
+//	secondOneThirtyAM  := twoAMAfterFallback.Add(-30 * time.Minute)
+//
+// ---------------------------------------------------------------------------
+
+func makeStopTime(stopID string, wallClockSeconds int64) *gtfsdb.StopTime {
+	nanos := wallClockSeconds * int64(time.Second)
+	return &gtfsdb.StopTime{
+		StopID:        stopID,
+		ArrivalTime:   nanos,
+		DepartureTime: nanos,
+	}
+}
+
+func TestFindClosestStopByTimeWithDelays_DSTFallback(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+
+	serviceDate := time.Date(2024, 11, 3, 0, 0, 0, 0, la)
+
+	stopTimes := []*gtfsdb.StopTime{
+		makeStopTime("stop-1am", 3600),   // 1:00 AM = 3 600 s
+		makeStopTime("stop-130am", 5400), // 1:30 AM = 5 400 s
+		makeStopTime("stop-230am", 9000), // 2:30 AM = 9 000 s
+	}
+
+	t.Run("first 1:30 AM (PDT, before fallback) — closest is stop-130am", func(t *testing.T) {
+		currentTime := time.Date(2024, 11, 3, 1, 30, 0, 0, la)
+		closestID, _ := findClosestStopByTimeWithDelays(currentTime, serviceDate, stopTimes, nil)
+		assert.Equal(t, "stop-130am", closestID,
+			"at the first 1:30 AM the closest stop should be the 1:30 AM stop")
+	})
+
+	t.Run("second 1:30 AM (PST, after fallback) — closest is still stop-130am", func(t *testing.T) {
+		// With the old (broken) code this returned stop-230am because real elapsed
+		// seconds were 9 000 s, making stop-130am appear 3 600 s in the past.
+		// Construct second 1:30 AM via unambiguous anchor: 2:00 AM PST minus 30 min.
+		twoAMAfterFallback := time.Date(2024, 11, 3, 2, 0, 0, 0, la)
+		currentTime := twoAMAfterFallback.Add(-30 * time.Minute)
+		closestID, _ := findClosestStopByTimeWithDelays(currentTime, serviceDate, stopTimes, nil)
+		assert.Equal(t, "stop-130am", closestID,
+			"at the second 1:30 AM the closest stop must still match the GTFS wall-clock entry")
+	})
+}
+
+func TestFindNextStopByTimeWithDelays_DSTFallback(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+
+	serviceDate := time.Date(2024, 11, 3, 0, 0, 0, 0, la)
+
+	stopTimes := []*gtfsdb.StopTime{
+		makeStopTime("stop-1am", 3600),
+		makeStopTime("stop-130am", 5400),
+		makeStopTime("stop-230am", 9000),
+	}
+
+	t.Run("first 1:30 AM — next stop is stop-230am", func(t *testing.T) {
+		currentTime := time.Date(2024, 11, 3, 1, 30, 0, 0, la)
+		nextID, _ := findNextStopByTimeWithDelays(currentTime, serviceDate, stopTimes, nil)
+		assert.Equal(t, "stop-230am", nextID)
+	})
+
+	t.Run("second 1:30 AM — next stop is still stop-230am (not beyond)", func(t *testing.T) {
+		// Construct second 1:30 AM PST via unambiguous anchor.
+		twoAMAfterFallback := time.Date(2024, 11, 3, 2, 0, 0, 0, la)
+		currentTime := twoAMAfterFallback.Add(-30 * time.Minute)
+		nextID, _ := findNextStopByTimeWithDelays(currentTime, serviceDate, stopTimes, nil)
+		assert.Equal(t, "stop-230am", nextID,
+			"after DST fallback the next stop should be 2:30 AM, not empty or wrapped")
+	})
+}
+
+func TestFindClosestStopByTimeWithDelays_NormalDay(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+
+	// A regular summer day — no DST transition.
+	serviceDate := time.Date(2024, 6, 15, 0, 0, 0, 0, la)
+
+	stopTimes := []*gtfsdb.StopTime{
+		makeStopTime("stop-8am", 28800),   // 8:00 AM = 28 800 s
+		makeStopTime("stop-830am", 30600), // 8:30 AM = 30 600 s
+		makeStopTime("stop-9am", 32400),   // 9:00 AM = 32 400 s
+	}
+
+	currentTime := time.Date(2024, 6, 15, 8, 31, 0, 0, la) // 8:31 AM
+	closestID, _ := findClosestStopByTimeWithDelays(currentTime, serviceDate, stopTimes, nil)
+	assert.Equal(t, "stop-830am", closestID)
+}
+
+func TestFindClosestStopByTimeWithDelays_OvernightTrip(t *testing.T) {
+	la, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+
+	// Service date is Jun 15; trip runs past midnight into Jun 16.
+	// GTFS encodes 1:00 AM next day as 25:00:00 = 90 000 s.
+	serviceDate := time.Date(2024, 6, 15, 0, 0, 0, 0, la)
+
+	stopTimes := []*gtfsdb.StopTime{
+		makeStopTime("stop-midnight", 86400), // 24:00:00 = midnight next day
+		makeStopTime("stop-1am-next", 90000), // 25:00:00 = 1:00 AM next day
+	}
+
+	currentTime := time.Date(2024, 6, 16, 1, 0, 0, 0, la) // 1:00 AM on Jun 16
+	closestID, _ := findClosestStopByTimeWithDelays(currentTime, serviceDate, stopTimes, nil)
+	assert.Equal(t, "stop-1am-next", closestID)
+}
+
+func TestInferOrientationFromShape(t *testing.T) {
+	tests := []struct {
+		name      string
+		lat, lon  float64
+		shape     []gtfs.ShapePoint
+		wantMin   float64
+		wantMax   float64
+		wantExact *float64
+	}{
+		{
+			name:      "fewer than 2 points returns -1",
+			lat:       40.0,
+			lon:       -122.0,
+			shape:     []gtfs.ShapePoint{{Latitude: 40.0, Longitude: -122.0}},
+			wantExact: floatPtr(-1),
+		},
+		{
+			name: "east heading (~0 degrees)",
+			lat:  40.0,
+			lon:  0.5,
+			shape: []gtfs.ShapePoint{
+				{Latitude: 40.0, Longitude: 0.0},
+				{Latitude: 40.0, Longitude: 1.0},
+			},
+			wantMin: 355.0,
+			wantMax: 5.0, // wraps through 0
+		},
+		{
+			name: "north heading (~90 degrees)",
+			lat:  0.5,
+			lon:  0.0,
+			shape: []gtfs.ShapePoint{
+				{Latitude: 0.0, Longitude: 0.0},
+				{Latitude: 1.0, Longitude: 0.0},
+			},
+			wantMin: 85.0,
+			wantMax: 95.0,
+		},
+		{
+			name: "south heading (~270 degrees)",
+			lat:  0.5,
+			lon:  0.0,
+			shape: []gtfs.ShapePoint{
+				{Latitude: 1.0, Longitude: 0.0},
+				{Latitude: 0.0, Longitude: 0.0},
+			},
+			wantMin: 265.0,
+			wantMax: 275.0,
+		},
+		{
+			name: "closest segment selection picks east segment over distant north segment",
+			lat:  40.1,
+			lon:  0.5,
+			shape: []gtfs.ShapePoint{
+				{Latitude: 40.0, Longitude: 0.0},
+				{Latitude: 40.0, Longitude: 1.0}, // east segment, vehicle is nearby
+				{Latitude: 80.0, Longitude: 0.0},
+				{Latitude: 81.0, Longitude: 0.0}, // north segment, vehicle is far away
+			},
+			wantMin: 355.0,
+			wantMax: 5.0, // east heading, wraps through 0
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := inferOrientationFromShape(tc.lat, tc.lon, tc.shape)
+			if tc.wantExact != nil {
+				assert.InDelta(t, *tc.wantExact, got, 0.001)
+				return
+			}
+			// Handle ranges that wrap through 0 (e.g. east heading: 355..5)
+			if tc.wantMin > tc.wantMax {
+				assert.True(t, got >= tc.wantMin || got <= tc.wantMax,
+					"expected orientation in [%.1f, 360) or [0, %.1f], got %.2f", tc.wantMin, tc.wantMax, got)
+			} else {
+				assert.InDelta(t, (tc.wantMin+tc.wantMax)/2, got, (tc.wantMax-tc.wantMin)/2+0.001,
+					"expected orientation between %.1f and %.1f, got %.2f", tc.wantMin, tc.wantMax, got)
+			}
+		})
+	}
+}
+
+func floatPtr(f float64) *float64 { return &f }

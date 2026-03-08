@@ -55,7 +55,7 @@ func (api *RestAPI) routeSearchHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	if ctx.Err() != nil {
-		api.serverErrorResponse(w, r, ctx.Err())
+		api.clientCanceledResponse(w, r, ctx.Err())
 		return
 	}
 
@@ -69,6 +69,7 @@ func (api *RestAPI) routeSearchHandler(w http.ResponseWriter, r *http.Request) {
 	agencyIDs := make(map[string]bool)
 	for _, routeRow := range routes {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
@@ -112,13 +113,22 @@ func (api *RestAPI) routeSearchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agencies := utils.FilterAgencies(api.GtfsManager.GetAgencies(), agencyIDs)
+
+	// Populate situation references for alerts affecting the returned routes
+	resultRawRouteIDs := make([]string, 0, len(routes))
+	for _, routeRow := range routes {
+		resultRawRouteIDs = append(resultRawRouteIDs, routeRow.ID)
+	}
+	alerts := api.collectAlertsForRoutes(resultRawRouteIDs)
+	situations := api.BuildSituationReferences(alerts)
+
 	references := models.ReferencesModel{
 		Agencies:   agencies,
-		Routes:     []interface{}{},
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
+		Routes:     []models.Route{},
+		Situations: situations,
+		StopTimes:  []models.RouteStopTime{},
 		Stops:      []models.Stop{},
-		Trips:      []interface{}{},
+		Trips:      []models.Trip{},
 	}
 
 	response := models.NewListResponse(results, references, false, api.Clock)

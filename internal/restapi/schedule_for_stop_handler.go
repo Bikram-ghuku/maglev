@@ -2,6 +2,7 @@ package restapi
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -190,6 +191,7 @@ func (api *RestAPI) scheduleForStopHandler(w http.ResponseWriter, r *http.Reques
 
 	for _, row := range scheduleRows {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
@@ -253,7 +255,7 @@ func (api *RestAPI) scheduleForStopHandler(w http.ResponseWriter, r *http.Reques
 			}
 		}
 
-		directionSchedule := models.NewStopRouteDirectionSchedule(tripHeadsign, stopTimes)
+		directionSchedule := models.NewStopRouteDirectionSchedule(tripHeadsign, stopTimes, nil)
 		routeSchedule := models.NewStopRouteSchedule(routeID, []models.StopRouteDirectionSchedule{directionSchedule})
 		routeSchedules = append(routeSchedules, routeSchedule)
 	}
@@ -279,11 +281,11 @@ func (api *RestAPI) scheduleForStopHandler(w http.ResponseWriter, r *http.Reques
 			utils.FormCombinedID(agencyID, trip.ServiceID),
 			trip.TripHeadsign.String,
 			trip.TripShortName.String,
-			trip.DirectionID.Int64,
+			strconv.FormatInt(trip.DirectionID.Int64, 10),
 			utils.FormCombinedID(agencyID, trip.BlockID.String),
 			utils.FormCombinedID(agencyID, trip.ShapeID.String),
 		)
-		references.Trips = append(references.Trips, tripRef)
+		references.Trips = append(references.Trips, *tripRef)
 	}
 
 	routeIDsWithAgency := make([]string, 0, len(routeIDs))

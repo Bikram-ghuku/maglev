@@ -163,7 +163,7 @@ Each entry in the `gtfs-rt-feeds` array supports:
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `id` | string | auto (`"feed-0"`, `"feed-1"`, …) | Unique identifier for the feed, used in logs and internal data partitioning |
-| `agency-ids` | array | `[]` | Transit agency IDs this feed provides data for |
+| `agency-ids` | array | `[]` | When set, only realtime data (trips, vehicles, alerts) belonging to the listed agency IDs is included. Data for other agencies in the same feed is filtered out. Agencies are resolved via route→agency mapping from the static GTFS data. |
 | `trip-updates-url` | string | `""` | URL for GTFS-RT trip updates protobuf |
 | `vehicle-positions-url` | string | `""` | URL for GTFS-RT vehicle positions protobuf |
 | `service-alerts-url` | string | `""` | URL for GTFS-RT service alerts protobuf |
@@ -198,6 +198,18 @@ CGO_ENABLED=1 go build -tags "sqlite_fts5" ./...
 
 Ensure you have a working C toolchain when CGO is enabled.
 
+## SQLite Drivers (Fast Mode vs. Compatible Mode)
+
+Maglev uses SQLite and supports two different drivers via Go build tags to balance production performance with developer experience:
+
+1. **Fast Mode (Default)**: Uses `github.com/mattn/go-sqlite3` (CGo). This is the default for production because of its high performance and support for advanced SQLite features like FTS5 (Full-Text Search). It requires a C compiler (GCC/Clang) installed on your system.
+   - Run tests: `make test`
+   - Build: `make build`
+
+2. **Compatible Mode**: Uses `modernc.org/sqlite` (Pure Go). This mode is intended for local development and CI on platforms where CGo is difficult to configure (like Windows). It does not require a C compiler.
+   - Run tests: `make test-pure`
+   - Build: `make build-pure`
+
 ## Directory Structure
 
 * `bin`: Compiled application binaries.
@@ -219,10 +231,30 @@ make build
 
 # Start the debugger
 dlv --listen=:2345 --headless=true --api-version=2 --accept-multiclient exec ./bin/maglev
-
 ```
 
 This allows debugging in the GoLand IDE.
+
+### Profiling (pprof)
+
+Maglev includes built-in Go `pprof` endpoints for debugging memory leaks and CPU bottlenecks. For security reasons, these are completely disabled by default and are never exposed on the public API port.
+
+To enable the profiling server, set the following environment variable:
+
+```bash
+MAGLEV_ENABLE_PPROF=1
+```
+
+When enabled, the debug server will start strictly on the local loopback interface at `127.0.0.1:6060`.
+
+**Accessing in Production:**  
+To securely access the profiles on a remote production server, do not open the port to the internet. Instead, use an SSH tunnel:
+
+```bash
+ssh -L 6060:localhost:6060 your-user@production-server
+```
+
+You can then view the profiles locally in your browser at `http://localhost:6060/debug/pprof/`.
 
 ## SQL
 

@@ -2,30 +2,25 @@ package restapi
 
 import (
 	"net/http"
-	"net/http/pprof"
 
 	"maglev.onebusaway.org/internal/models"
 )
 
 type handlerFunc func(w http.ResponseWriter, r *http.Request)
 
-// rateLimitAndValidateAPIKey combines rate limiting, API key validation, and compression
+// rateLimitAndValidateAPIKey combines rate limiting and API key validation
 func rateLimitAndValidateAPIKey(api *RestAPI, finalHandler handlerFunc) http.Handler {
-	// Create the handler chain: API key validation -> rate limiting -> compression -> final handler
 	finalHandlerHttp := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		finalHandler(w, r)
 	})
 
-	// Apply compression first (innermost)
-	compressedHandler := CompressionMiddleware(finalHandlerHttp)
-
-	// Then rate limiting - use the shared rate limiter instance
+	// Apply rate limiting directly to the final handler - use the shared rate limiter instance
 	var rateLimitedHandler http.Handler
 	if api.rateLimiter != nil {
-		rateLimitedHandler = api.rateLimiter.Handler()(compressedHandler)
+		rateLimitedHandler = api.rateLimiter.Handler()(finalHandlerHttp)
 	} else {
 		// Fallback for tests that don't use NewRestAPI constructor
-		rateLimitedHandler = compressedHandler
+		rateLimitedHandler = finalHandlerHttp
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -34,7 +29,7 @@ func rateLimitAndValidateAPIKey(api *RestAPI, finalHandler handlerFunc) http.Han
 			api.invalidAPIKeyResponse(w, r)
 			return
 		}
-		// Then apply rate limiting and compression
+		// Then apply rate limiting
 		rateLimitedHandler.ServeHTTP(w, r)
 	})
 }
@@ -78,33 +73,19 @@ func withProtectedCombinedID(api *RestAPI, handler http.HandlerFunc) http.Handle
 		innerHandler(w, r)
 	})
 
-	// Apply compression first (innermost)
-	compressedHandler := CompressionMiddleware(finalHandlerHttp)
-
-	// Then rate limiting
+	// Apply rate limiting directly to the final handler
 	var rateLimitedHandler http.Handler
 	if api.rateLimiter != nil {
-		rateLimitedHandler = api.rateLimiter.Handler()(compressedHandler)
+		rateLimitedHandler = api.rateLimiter.Handler()(finalHandlerHttp)
 	} else {
-		rateLimitedHandler = compressedHandler
+		rateLimitedHandler = finalHandlerHttp
 	}
 
 	// Auth check outermost, matching rateLimitAndValidateAPIKey pattern
 	return api.validateProtectedAPIKey(rateLimitedHandler)
 }
 
-func registerPprofHandlers(mux *http.ServeMux) { // nolint:unused
-	// Register pprof handlers
-	// import "net/http/pprof"
-	// Tutorial: https://medium.com/@rahul.fiem/application-performance-optimization-how-to-effectively-analyze-and-optimize-pprof-cpu-profiles-95280b2f5bfb
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-}
-
-// SetRoutes registers all API endpoints with compression applied per route
+// SetRoutes registers all API endpoints with the provided mux
 func (api *RestAPI) SetRoutes(mux *http.ServeMux) {
 	// Health check endpoint - no authentication required
 	mux.HandleFunc("GET /healthz", api.healthHandler)
@@ -161,7 +142,9 @@ func (api *RestAPI) SetupAPIRoutes() http.Handler {
 	// Register all API routes
 	api.SetRoutes(mux)
 
-	// Apply global middleware chain: compression -> base routes
-	// This ensures all responses are compressed
-	return CompressionMiddleware(mux)
+	// Apply global middleware chain: expiry -> compression -> base routes
+	// This ensures all responses are compressed & have expiry headers
+	var handler http.Handler = mux
+	handler = GtfsExpiryMiddleware(api.GtfsManager)(handler)
+	return CompressionMiddleware(handler)
 }

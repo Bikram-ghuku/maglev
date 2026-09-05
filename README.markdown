@@ -89,6 +89,8 @@ Example `config.json`:
   "env": "production",
   "api-keys": ["key1", "key2", "key3"],
   "rate-limit": 50,
+  "log-level": "info",
+  "log-format": "json",
   "gtfs-static-feed": {
     "url": "https://example.com/gtfs.zip",
     "auth-header-name": "Authorization",
@@ -116,18 +118,16 @@ Example `config.json`:
   ],
   "data-path": "/data/gtfs.db"
 }
-
 ```
 
-**Note:** The `-f` flag is mutually exclusive with other command-line flags. If you use `-f`, all other configuration flags will be ignored. The system will error if you try to use both.
+**Note:** The `-f` flag is mutually exclusive with other command-line flags. If you use `-f`, all other configuration flags will be ignored. The system will return an error if you try to use both.
 
 **Dump Current Configuration:**
 
 ```bash
-./bin/maglev --dump-config > my-config.json
+./bin/maglev -dump-config > my-config.json
 # or with other flags
-./bin/maglev -port 8080 -env production --dump-config > config.json
-
+./bin/maglev -port 8080 -env production -dump-config > config.json
 ```
 
 **JSON Schema & IDE Integration:**
@@ -146,30 +146,36 @@ A JSON schema file is provided at `config.schema.json` for IDE autocomplete and 
 
 ### Configuration Options
 
-| Option | Type | Default | Description |
-| --- | --- | --- | --- |
-| `port` | integer | 4000 | API server port |
-| `env` | string | "development" | Environment (development, test, production) |
-| `api-keys` | array | ["test"] | API keys for authentication |
-| `rate-limit` | integer | 100 | Requests per second per API key |
-| `gtfs-static-feed` | object | (Sound Transit) | Static GTFS feed configuration |
-| `gtfs-rt-feeds` | array | (Sound Transit) | GTFS-RT feed configurations (see below) |
-| `data-path` | string | "./gtfs.db" | Path to SQLite database |
+| Option             | Type    | Default         | Description                                 |
+| ------------------ | ------- | --------------- | ------------------------------------------- |
+| `port`               | integer | 4000            | API server port                             |
+| `env`                | string  | "development"   | Environment (development, test, production) |
+| `api-keys`           | array   | ["test"]        | API keys for authentication                 |
+| `protected-api-keys` | array   | (test keys)     | Secret API keys for sensitive endpoints     |
+| `exempt-api-keys`    | array   | (Sound Transit) | API keys exempt from rate limiting          |
+| `log-level`          | string  | "info"          | Log level (debug, info, warn, error)        |
+| `log-format`         | string  | "text"          | Log format (text, json)                     |
+| `rate-limit`         | integer | 100             | Requests per second per API key             |
+| `gtfs-static-feed`   | object  | (Sound Transit) | Static GTFS feed configuration              |
+| `gtfs-rt-feeds`      | array   | (Sound Transit) | GTFS-RT feed configurations (see below)     |
+| `data-path`          | string  | "./gtfs.db"     | Path to SQLite database                     |
 
 #### GTFS-RT Feed Options
 
 Each entry in the `gtfs-rt-feeds` array supports:
 
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `id` | string | auto (`"feed-0"`, `"feed-1"`, …) | Unique identifier for the feed, used in logs and internal data partitioning |
-| `agency-ids` | array | `[]` | Transit agency IDs this feed provides data for |
-| `trip-updates-url` | string | `""` | URL for GTFS-RT trip updates protobuf |
-| `vehicle-positions-url` | string | `""` | URL for GTFS-RT vehicle positions protobuf |
-| `service-alerts-url` | string | `""` | URL for GTFS-RT service alerts protobuf |
-| `headers` | object | `{}` | HTTP headers sent with every request to this feed |
-| `refresh-interval` | integer | `30` | Polling interval in seconds |
-| `enabled` | boolean | `true` | Set to `false` to disable polling without removing the entry |
+| Field                   | Type    | Default                          | Description                                                                                                                                                                                                                                |
+| ----------------------- | ------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`                    | string  | auto (`"feed-0"`, `"feed-1"`, …) | Unique identifier for the feed, used in logs and internal data partitioning                                                                                                                                                                |
+| `agency-ids`            | array   | `[]`                             | When set, only realtime data (trips, vehicles, alerts) belonging to the listed agency IDs is included. Data for other agencies in the same feed is filtered out. Agencies are resolved via route→agency mapping from the static GTFS data. |
+| `trip-updates-url`      | string  | `""`                             | URL for GTFS-RT trip updates protobuf                                                                                                                                                                                                      |
+| `vehicle-positions-url` | string  | `""`                             | URL for GTFS-RT vehicle positions protobuf                                                                                                                                                                                                 |
+| `service-alerts-url`    | string  | `""`                             | URL for GTFS-RT service alerts protobuf                                                                                                                                                                                                    |
+| `realtime-auth-header-name`  | string  | `""`                             | Optional header name for GTFS-RT auth (legacy)                                                                                                                                                                                             |
+| `realtime-auth-header-value` | string  | `""`                             | Optional header value for GTFS-RT auth (legacy)                                                                                                                                                                                            |
+| `headers`                    | object  | `{}`                             | HTTP headers sent with every request to this feed                                                                                                                                                                                          |
+| `refresh-interval`           | integer | `30`                             | Polling interval in seconds                                                                                                                                                                                                                |
+| `enabled`                    | boolean | `true`                           | Set to `false` to disable polling without removing the entry                                                                                                                                                                               |
 
 A feed must have at least one URL (`trip-updates-url`, `vehicle-positions-url`, or `service-alerts-url`) to be activated. Each feed runs its own independent polling goroutine. Data from all enabled feeds is merged into a single unified view for the API.
 
@@ -182,21 +188,38 @@ All basic commands are managed by our Makefile:
 * `make clean` - Delete all build and coverage artifacts.
 * `make coverage` - Test and generate HTML coverage artifacts.
 * `make test` - Run tests.
+* `make load-test` - Run smoketest and stresstest (k6).
 * `make models` - Generate Go code from SQL queries using sqlc.
 * `make watch` - Build and run the app with Air for live reloading.
+* `make update-openapi` - Fetch the latest upstream OpenAPI spec and overwrite `testdata/openapi.yml`.
+* `make check-openapi` - Check whether `testdata/openapi.yml` is in sync with upstream (exits 1 if out of date).
+
+CI checks that `testdata/openapi.yml` is in sync with [OneBusAway/sdk-config](https://github.com/OneBusAway/sdk-config/blob/main/stainless/openapi.yml) on every push and PR. If the upstream spec has changed, CI will fail with a message to run `make update-openapi` and commit the result. If you find issues in the upstream spec, open an issue at [OneBusAway/sdk-config](https://github.com/OneBusAway/sdk-config/issues).
 
 ### FTS5 (SQLite) builds and tests
 
 The server uses `github.com/mattn/go-sqlite3` and SQLite FTS5 for route search. Build and test with the FTS5 tag enabled:
 
 ```bash
-CGO_ENABLED=1 go test -tags "sqlite_fts5" ./...
+CGO_ENABLED=1 go test -tags "sqlite_fts5 sqlite_math_functions" ./...
 # or
-CGO_ENABLED=1 go build -tags "sqlite_fts5" ./...
+CGO_ENABLED=1 go build -tags "sqlite_fts5 sqlite_math_functions" ./...
 
 ```
 
 Ensure you have a working C toolchain when CGO is enabled.
+
+## SQLite Drivers (Fast Mode vs. Compatible Mode)
+
+Maglev uses SQLite and supports two different drivers via Go build tags to balance production performance with developer experience:
+
+1. **Fast Mode (Default)**: Uses `github.com/mattn/go-sqlite3` (CGo). This is the default for production because of its high performance and support for advanced SQLite features like FTS5 (Full-Text Search). It requires a C compiler (GCC/Clang) installed on your system.
+   - Run tests: `make test`
+   - Build: `make build`
+
+2. **Compatible Mode**: Uses `modernc.org/sqlite` (Pure Go). This mode is intended for local development and CI on platforms where CGo is difficult to configure (like Windows). It does not require a C compiler.
+   - Run tests: `make test-pure`
+   - Build: `make build-pure`
 
 ## Directory Structure
 
@@ -219,10 +242,30 @@ make build
 
 # Start the debugger
 dlv --listen=:2345 --headless=true --api-version=2 --accept-multiclient exec ./bin/maglev
-
 ```
 
 This allows debugging in the GoLand IDE.
+
+### Profiling (pprof)
+
+Maglev includes built-in Go `pprof` endpoints for debugging memory leaks and CPU bottlenecks. For security reasons, these are completely disabled by default and are never exposed on the public API port.
+
+To enable the profiling server, set the following environment variable:
+
+```bash
+MAGLEV_ENABLE_PPROF=1
+```
+
+When enabled, the debug server will start strictly on the local loopback interface at `127.0.0.1:6060`.
+
+**Accessing in Production:**  
+To securely access the profiles on a remote production server, do not open the port to the internet. Instead, use an SSH tunnel:
+
+```bash
+ssh -L 6060:localhost:6060 your-user@production-server
+```
+
+You can then view the profiles locally in your browser at `http://localhost:6060/debug/pprof/`.
 
 ## SQL
 
@@ -299,15 +342,15 @@ make docker-compose-dev
 
 ### Docker Make Targets
 
-| Command | Description |
-| --- | --- |
-| `make docker-build` | Build the Docker image |
-| `make docker-run` | Build and run the container |
-| `make docker-stop` | Stop and remove the container |
-| `make docker-compose-up` | Start with Docker Compose |
-| `make docker-compose-down` | Stop Docker Compose services |
-| `make docker-compose-dev` | Start development environment |
-| `make docker-clean` | Remove all Docker artifacts |
+| Command                    | Description                   |
+| -------------------------- | ----------------------------- |
+| `make docker-build`        | Build the Docker image        |
+| `make docker-run`          | Build and run the container   |
+| `make docker-stop`         | Stop and remove the container |
+| `make docker-compose-up`   | Start with Docker Compose     |
+| `make docker-compose-down` | Stop Docker Compose services  |
+| `make docker-compose-dev`  | Start development environment |
+| `make docker-clean`        | Remove all Docker artifacts   |
 
 ### Data Persistence
 
@@ -406,15 +449,14 @@ docker inspect --format='{{.State.Health.Status}}' maglev
 # In docker-compose.yml or docker-compose.dev.yml
 environment:
   - HEALTH_CHECK_KEY=your-api-key
-
 ```
 
 ### Environment Variables
 
-| Variable | Description | Default |
-| --- | --- | --- |
-| `TZ` | Timezone for the container | `UTC` |
-| `HEALTH_CHECK_KEY` | API key used for health check endpoint | `test` |
+| Variable           | Description                            | Default |
+| ------------------ | -------------------------------------- | ------- |
+| `TZ`               | Timezone for the container             | `UTC`   |
+| `HEALTH_CHECK_KEY` | API key used for health check endpoint | `test`  |
 
 ### Troubleshooting
 
@@ -439,5 +481,5 @@ curl http://localhost:4000/healthz
 
 **Permission issues:**
 
-* The container runs as non-root user (maglev:1000).
+* The container runs as a non-root user (maglev:1000).
 * Ensure mounted volumes are accessible.

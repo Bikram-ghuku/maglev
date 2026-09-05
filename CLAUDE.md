@@ -21,13 +21,26 @@ All commands are managed through the Makefile:
 - `make run` - Build and run the server with config from `config.json`
 - `make build` - Build the application binary to `bin/maglev`
 - `make test` - Run all tests
-- `make lint` - Run golangci-lint (requires: `go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest`)
+- `make load-test` - Run smoketest and stresstest (k6)
+- `make lint` - Run `go vet`
 - `make coverage` - Generate test coverage report with HTML output
 - `make coverage-report` - Output per-package test coverage as JSON for CI parsing (requires jq)
 - `make models` - Regenerate sqlc models from SQL queries
 - `make watch` - Run with Air for live reloading during development
 - `make fmt` - Format all Go code with `go fmt`
 - `make clean` - Clean build artifacts
+- `make build-pure` - Build without CGO (pure Go SQLite driver)
+- `make test-pure` - Run tests without CGO
+- `make update-openapi` - Fetch latest upstream OpenAPI spec and overwrite `testdata/openapi.yml`
+- `make check-openapi` - Verify `testdata/openapi.yml` matches upstream (exits 1 if out of date)
+
+**Build tags**: When running `go` commands directly (not via Makefile), you must pass `-tags "sqlite_fts5 sqlite_math_functions"` for CGO builds or `-tags "purego"` for pure Go builds.
+
+**OpenAPI spec**: CI checks that `testdata/openapi.yml` is in sync with [OneBusAway/sdk-config](https://github.com/OneBusAway/sdk-config/blob/main/stainless/openapi.yml) on every push and PR. If upstream has changed, CI fails — run `make update-openapi` locally and commit the updated file.
+
+## Load Testing and Profiling
+
+See `loadtest/README.md`. Start with pprof enabled: `MAGLEV_ENABLE_PPROF=1 make run`, then run `k6 run loadtest/k6/scenarios.js`. Capture CPU profiles with `go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30`.
 
 ## Docker Commands
 
@@ -78,13 +91,11 @@ dlv --listen=:2345 --headless=true --api-version=2 --accept-multiclient exec ./b
 
 Then connect from GoLand IDE or other Delve-compatible debugger.
 
-## Important: Requirements to make a commit
+## Contributing
 
-Before committing any code, you must always run all of these steps, and have them all succeed:
+@CONTRIBUTING.md
 
-1. Run `make lint` and fix any linting issues that are identified
-2. Run `make test` and fix any failing tests
-3. Run `go fmt ./...` and commit all of the formatting changes
+Follow these guidelines in full before making or even proposing any code changes in this repo — its guidelines on size, scope, commit hygiene, testing, code reuse, and complexity should shape the code as it's written, not just get checked afterward.
 
 ## Architecture Overview
 
@@ -329,13 +340,11 @@ When a single feed refreshes, only its per-feed sub-map is overwritten; other fe
 
 ### Working with sqlc Models
 
-Database models use `sql.NullString` for optional fields:
+Database models use `sql.NullString` for optional fields. Use helpers in the
+nulls package for working with nullable SQL types.
 
 ```go
-// Always check .Valid before accessing .String
-if route.ShortName.Valid {
-    shortName = route.ShortName.String
-}
+shortName := nulls.StringOrEmpty(route.ShortName)
 ```
 
 Common nullable fields: `ShortName`, `LongName`, `Desc`, `Url`, `Color`, `TextColor`
@@ -540,6 +549,6 @@ Maglev supports JSON configuration files with IDE validation via `config.schema.
 
 The official REST API documentation is available at: https://developer.onebusaway.org/api/where/methods
 
-The Open API specification is located at https://github.com/OneBusAway/sdk-config/blob/main/openapi.yml
+The Open API specification is located at https://github.com/OneBusAway/sdk-config/blob/main/stainless/openapi.yml
 
-You should always fetch the latest version of the OpenAPI specification from the OneBusAway SDK Config repository before implementing new endpoints or modifying existing ones.
+**All API endpoints MUST behave identically to what is defined in this OpenAPI spec.** This is the single source of truth for request parameters, response schemas, field names, types, and status codes. Always fetch the latest version of this spec before implementing new endpoints or modifying existing ones. If the codebase diverges from the spec, the spec wins.

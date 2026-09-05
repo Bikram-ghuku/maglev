@@ -1,11 +1,12 @@
 # Detect OS (MSYS2 sets MSYSTEM; prefer Unix syntax over Windows CMD syntax)
-ifneq ($(MSYSTEM),)
-    SET_ENV := CGO_ENABLED=1 CGO_CFLAGS="-DSQLITE_ENABLE_FTS5"
-else ifeq ($(OS),Windows_NT)
-    SET_ENV := set CGO_ENABLED=1 & set CGO_CFLAGS=-DSQLITE_ENABLE_FTS5 &
+ifeq ($(OS),Windows_NT)
+    SET_ENV := set CGO_ENABLED=1
 else
-    SET_ENV := CGO_ENABLED=1 CGO_CFLAGS="-DSQLITE_ENABLE_FTS5"
+    SET_ENV := CGO_ENABLED=1
 endif
+
+BUILD_TAGS := sqlite_fts5 sqlite_math_functions
+PURE_TAGS := purego
 
 DOCKER_IMAGE := opentransitsoftwarefoundation/maglev
 
@@ -33,21 +34,27 @@ LDFLAGS := -ldflags "-X 'maglev.onebusaway.org/internal/buildinfo.CommitHash=$(G
                     -X 'maglev.onebusaway.org/internal/buildinfo.CommitMessage=$(GIT_MSG)' \
                     -X 'maglev.onebusaway.org/internal/buildinfo.Host=$(BUILD_HOST)'"
 
-.PHONY: build build-debug clean coverage-report check-jq coverage test run lint watch fmt \
-        gtfstidy models check-golangci-lint \
-        docker-build docker-push docker-run docker-stop docker-compose-up docker-compose-down docker-compose-dev docker-clean docker-clean-all
+.PHONY: build build-debug clean coverage-report check-jq check-k6 coverage test run lint watch fmt \
+        gtfstidy models \
+        test-latency bench-sqlite-all bench-sqlite-perftest \
+        docker-build docker-push docker-run docker-stop docker-compose-up docker-compose-down docker-compose-dev docker-clean docker-clean-all \
+        update-openapi check-openapi \
+        smoketest stresstest load-test
 
 run: build
 	bin/maglev -f config.json
 
 build: gtfstidy
-	$(SET_ENV) go build -tags "sqlite_fts5" $(LDFLAGS) -o bin/maglev ./cmd/api
+	$(SET_ENV) go build -tags "$(BUILD_TAGS)" $(LDFLAGS) -o bin/maglev ./cmd/api
+
+build-pure: gtfstidy
+	CGO_ENABLED=0 go build -tags "$(PURE_TAGS)" $(LDFLAGS) -o bin/maglev ./cmd/api
 
 build-debug: gtfstidy
-	$(SET_ENV) go build -tags "sqlite_fts5" $(LDFLAGS) -gcflags "all=-N -l" -o bin/maglev ./cmd/api
+	$(SET_ENV) go build -tags "$(BUILD_TAGS)" $(LDFLAGS) -gcflags "all=-N -l" -o bin/maglev ./cmd/api
 
 gtfstidy:
-	$(SET_ENV) go build -tags "sqlite_fts5" -o bin/gtfstidy github.com/patrickbr/gtfstidy
+	$(SET_ENV) go build -tags "$(BUILD_TAGS)" -o bin/gtfstidy github.com/patrickbr/gtfstidy
 
 clean:
 	go clean
@@ -57,28 +64,49 @@ clean:
 check-jq:
 	@which jq > /dev/null 2>&1 || (echo "Error: jq is not installed. Install with: apt install jq, or brew install jq" && exit 1)
 
+check-k6:
+	@which k6 > /dev/null 2>&1 || (echo "Error: k6 is not installed. Install with: https://grafana.com/docs/k6/latest/set-up/install-k6/" && exit 1)
+
 coverage-report: check-jq
-	$(SET_ENV) go test -tags "sqlite_fts5" ./... -cover > /tmp/go-coverage.txt 2>&1 || (cat /tmp/go-coverage.txt && exit 1)
+	$(SET_ENV) go test -tags "$(BUILD_TAGS)" ./... -cover > /tmp/go-coverage.txt 2>&1 || (cat /tmp/go-coverage.txt && exit 1)
 	grep '^ok' /tmp/go-coverage.txt | awk '{print $$2, $$5}' | jq -R 'split(" ") | {pkg: .[0], coverage: .[1]}'
 
 coverage:
-	$(SET_ENV) go test -tags "sqlite_fts5" -coverprofile=coverage.out ./...
+	$(SET_ENV) go test -tags "$(BUILD_TAGS)" -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out
 
-check-golangci-lint:
-	@which golangci-lint > /dev/null 2>&1 || (echo "Error: golangci-lint is not installed. Please install it by running: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest" && exit 1)
-
-lint: check-golangci-lint
-	golangci-lint run --build-tags "sqlite_fts5"
+lint:
+	$(SET_ENV) go vet -tags "$(BUILD_TAGS)" ./...
 
 fmt:
 	go fmt ./...
 
 test:
-	$(SET_ENV) go test -tags "sqlite_fts5" ./...
+	$(SET_ENV) go test -tags "$(BUILD_TAGS)" ./...
+
+test-latency:
+	$(SET_ENV) go test -tags "$(BUILD_TAGS)" ./gtfsdb/ -run "TestQueryLatency|TestExplainQueryPlans|TestConnectionPoolTuning" -v -count=1 -timeout 300s
+
+bench-sqlite-all:
+	$(SET_ENV) go test -tags "$(BUILD_TAGS)" ./gtfsdb/ -bench=. -benchmem -benchtime=5s -run=^$
+
+bench-sqlite-perftest:
+	$(SET_ENV) go test -tags "$(BUILD_TAGS) perftest" ./gtfsdb/ -bench=BenchmarkLargeDataset -benchmem -benchtime=10s -run=^$
+
+test-pure:
+	CGO_ENABLED=0 go test -tags "$(PURE_TAGS)" ./...
 
 models:
 	go tool sqlc generate -f gtfsdb/sqlc.yml
+
+# Fetch the latest upstream OpenAPI spec and overwrite testdata/openapi.yml.
+update-openapi:
+	bash scripts/update-openapi.sh
+
+# Check whether testdata/openapi.yml matches the live upstream (skipping header).
+# Exits 1 if out of date (useful for CI checks).
+check-openapi:
+	bash scripts/check-openapi.sh
 
 watch:
 	air
@@ -138,3 +166,55 @@ docker-clean:
 	@if docker image inspect $(DOCKER_IMAGE):latest >/dev/null 2>&1; then docker rmi $(DOCKER_IMAGE):latest && echo "Removed $(DOCKER_IMAGE):latest" || echo "Warning: Could not remove $(DOCKER_IMAGE):latest (may be in use)"; fi
 	@if docker image inspect $(DOCKER_IMAGE):dev >/dev/null 2>&1; then docker rmi $(DOCKER_IMAGE):dev && echo "Removed $(DOCKER_IMAGE):dev" || echo "Warning: Could not remove $(DOCKER_IMAGE):dev (may be in use)"; fi
 	@echo "Cleanup complete."
+
+define run_load_test
+	@set -e; \
+	printf '%s\n' \
+	  '{' \
+	  '  "port": 4000,' \
+	  '  "env": "development",' \
+	  '  "api-keys": ["test"],' \
+	  '  "rate-limit": $(1),' \
+	  '  "log-level": "$(2)",' \
+	  '  "log-format": "json",' \
+	  '  "gtfs-static-feed": {' \
+	  '    "url": "testdata/raba.zip",' \
+	  '    "enable-gtfs-tidy": false' \
+	  '  },' \
+	  '  "gtfs-rt-feeds": [],' \
+	  '  "data-path": "./ci-gtfs.db"' \
+	  '}' > config.ci.json; \
+	$(3)./bin/maglev -f config.ci.json > maglev.log 2>&1 & \
+	MAGLEV_PID=$$!; \
+	trap 'kill $$MAGLEV_PID 2>/dev/null || true; rm -f config.ci.json maglev.log ci-gtfs.db' EXIT; \
+	echo "Waiting for Maglev to be ready..."; \
+	ready=0; \
+	for i in $$(seq 1 60); do \
+	  if curl -sf http://localhost:4000/healthz > /dev/null 2>&1; then \
+	    echo "Server is ready after $${i} attempts."; \
+	    ready=1; \
+	    break; \
+	  fi; \
+	  echo "  Attempt $${i}/60 — not ready yet, waiting 5s..."; \
+	  tail -1 maglev.log 2>/dev/null || true; \
+	  sleep 5; \
+	done; \
+	if [ "$$ready" -ne 1 ]; then \
+	  echo "ERROR: Server did not become ready in time. Dumping logs:"; \
+	  cat maglev.log; \
+	  exit 1; \
+	fi; \
+	k6 run \
+	  $(4) \
+	  --summary-export=$(5) \
+	  loadtest/k6/scenarios.js
+endef
+
+load-test: smoketest stresstest
+
+smoketest: build check-k6
+	$(call run_load_test,100,info,,--vus 5 --duration 30s,loadtest/k6/smoke-summary.json)
+
+stresstest: build check-k6
+	$(call run_load_test,1000,warn,MAGLEV_ENABLE_PPROF=1 ,-e USE_FALLBACKS=true,loadtest/k6/stress-summary.json)
+		

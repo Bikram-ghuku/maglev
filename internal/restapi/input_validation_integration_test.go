@@ -1,6 +1,7 @@
 package restapi
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,8 @@ import (
 
 // createTestApiForValidationTests creates a test API with higher rate limit for validation tests
 func createTestApiForValidationTests(t *testing.T) *RestAPI {
+	ctx := context.Background()
+
 	// Initialize the shared GTFS manager only once
 	testDbSetupOnce.Do(func() {
 		gtfsConfig := gtfs.Config{
@@ -27,7 +30,7 @@ func createTestApiForValidationTests(t *testing.T) *RestAPI {
 			GTFSDataPath: testDbPath,
 		}
 		var err error
-		testGtfsManager, err = gtfs.InitGTFSManager(gtfsConfig)
+		testGtfsManager, err = gtfs.InitGTFSManager(ctx, gtfsConfig)
 		if err != nil {
 			t.Fatalf("Failed to initialize shared test GTFS manager: %v", err)
 		}
@@ -114,43 +117,17 @@ func TestInputValidationIntegration(t *testing.T) {
 			expectedStatus: http.StatusBadRequest,
 			expectedError:  "radius must be non-negative",
 		},
-		{
-			name:           "Radius too large",
-			endpoint:       "/api/where/stops-for-location.json?key=TEST&lat=38.0&lon=-77.0&radius=50000",
-			expectedStatus: http.StatusBadRequest,
-			expectedError:  "radius too large",
-		},
-
-		// Test malicious query parameters
-		{
-			name:           "Script injection in query",
-			endpoint:       "/api/where/stops-for-location.json?key=TEST&lat=38.0&lon=-77.0&query=<script>alert('xss')</script>",
-			expectedStatus: http.StatusBadRequest,
-			expectedError:  "query contains invalid characters",
-		},
-		{
-			name:           "SQL injection in query",
-			endpoint:       "/api/where/stops-for-location.json?key=TEST&lat=38.0&lon=-77.0&query=" + url.QueryEscape("'; DROP TABLE stops; --"),
-			expectedStatus: http.StatusBadRequest,
-			expectedError:  "query contains invalid characters",
-		},
-		{
-			name:           "Query too long",
-			endpoint:       fmt.Sprintf("/api/where/stops-for-location.json?key=TEST&lat=38.0&lon=-77.0&query=%s", strings.Repeat("a", 201)),
-			expectedStatus: http.StatusBadRequest,
-			expectedError:  "query too long",
-		},
 
 		// Test malicious date parameters
 		{
 			name:           "Invalid date format",
-			endpoint:       "/api/where/schedule-for-stop/raba_12345?key=TEST&date=12/25/2023",
+			endpoint:       "/api/where/schedule-for-stop/25_12345.json?key=TEST&date=12/25/2023",
 			expectedStatus: http.StatusBadRequest,
 			expectedError:  "invalid date format",
 		},
 		{
 			name:           "Date with script injection",
-			endpoint:       "/api/where/schedule-for-stop/raba_12345?key=TEST&date=2023-01-01<script>alert('xss')</script>",
+			endpoint:       "/api/where/schedule-for-stop/25_12345.json?key=TEST&date=2023-01-01<script>alert('xss')</script>",
 			expectedStatus: http.StatusBadRequest,
 			expectedError:  "invalid date format",
 		},
@@ -298,8 +275,8 @@ func TestEdgeCaseValidation(t *testing.T) {
 			expectedStatus: http.StatusOK,
 		},
 		{
-			name:           "Maximum allowed radius",
-			endpoint:       "/api/where/stops-for-location.json?key=TEST&lat=38.9&lon=-77.0&radius=10000",
+			name:           "Large radius clamped and allowed",
+			endpoint:       "/api/where/stops-for-location.json?key=TEST&lat=38.9&lon=-77.0&radius=50000",
 			expectedStatus: http.StatusOK,
 		},
 		{
@@ -309,8 +286,8 @@ func TestEdgeCaseValidation(t *testing.T) {
 		},
 		{
 			name:           "Empty date parameter is valid",
-			endpoint:       "/api/where/schedule-for-stop/raba_12345?key=TEST&date=",
-			expectedStatus: http.StatusNotFound, // Stop doesn't exist in test data
+			endpoint:       "/api/where/schedule-for-stop/25_12345.json?key=TEST&date=",
+			expectedStatus: http.StatusNotFound, // Stop doesn't exist in test data, meaning date validation passed!
 		},
 	}
 

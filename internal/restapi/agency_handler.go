@@ -4,36 +4,26 @@ import (
 	"net/http"
 
 	"maglev.onebusaway.org/internal/models"
-	"maglev.onebusaway.org/internal/utils"
 )
 
+// agencyHandler returns details for a single transit agency identified by its path ID.
 func (api *RestAPI) agencyHandler(w http.ResponseWriter, r *http.Request) {
-	// We can ignore the bool return because middleware guarantees presence
-	id, _ := utils.GetIDFromContext(r.Context())
+	id, ok := api.extractAndValidateID(w, r)
+	if !ok {
+		return
+	}
 
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
-	agency := api.GtfsManager.FindAgency(id)
-
+	agency, err := api.GtfsManager.FindAgency(r.Context(), id)
+	if err != nil {
+		api.serverErrorResponse(w, r, err)
+		return
+	}
 	if agency == nil {
 		api.sendNotFound(w, r)
 		return
 	}
 
-	agencyData := models.NewAgencyReference(
-		agency.Id,
-		agency.Name,
-		agency.Url,
-		agency.Timezone,
-		agency.Language,
-		agency.Phone,
-		agency.Email,
-		agency.FareUrl,
-		"",
-		false,
-	)
-
-	response := models.NewEntryResponse(agencyData, models.NewEmptyReferences(), api.Clock)
+	agencyData := models.AgencyReferenceFromDatabase(agency)
+	response := models.NewEntryResponse(agencyData, *models.NewEmptyReferences(), api.Clock)
 	api.sendResponse(w, r, response)
 }

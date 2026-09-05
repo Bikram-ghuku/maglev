@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3" // CGo-based SQLite driver
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"maglev.onebusaway.org/internal/appconf"
+	"maglev.onebusaway.org/internal/nulls"
 )
 
 func TestSQLitePerformancePragmasApplied(t *testing.T) {
@@ -232,7 +232,7 @@ func TestConfigureConnectionPoolWithDifferentConfigs(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			db, err := sql.Open("sqlite3", ":memory:")
+			db, err := sql.Open(DriverName, ":memory:")
 			require.NoError(t, err)
 			defer func() { _ = db.Close() }()
 
@@ -278,7 +278,7 @@ func TestSQLitePerformanceWithBulkOperations(t *testing.T) {
 	_, err = client.Queries.CreateRoute(ctx, CreateRouteParams{
 		ID:        "perf_route",
 		AgencyID:  "perf_agency",
-		ShortName: sql.NullString{String: "PERF", Valid: true},
+		ShortName: nulls.String("PERF"),
 		Type:      3,
 	})
 	require.NoError(t, err)
@@ -300,7 +300,7 @@ func TestSQLitePerformanceWithBulkOperations(t *testing.T) {
 	// Create a test stop
 	_, err = client.Queries.CreateStop(ctx, CreateStopParams{
 		ID:   "stop_1",
-		Name: sql.NullString{String: "Performance Test Stop", Valid: true},
+		Name: nulls.String("Performance Test Stop"),
 		Lat:  40.0,
 		Lon:  -74.0,
 	})
@@ -330,7 +330,7 @@ func TestSQLitePerformanceWithBulkOperations(t *testing.T) {
 	}
 
 	// This should complete quickly with proper pragmas
-	err = client.bulkInsertStopTimes(ctx, stopTimes)
+	err = client.bulkInsertStopTimes(ctx, stopTimes, nil)
 	require.NoError(t, err, "Bulk insert should succeed with performance pragmas")
 
 	// Verify all inserted

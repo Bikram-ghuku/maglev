@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"maglev.onebusaway.org/internal/clock"
 )
 
@@ -12,7 +13,7 @@ func TestCurrentTimeModel(t *testing.T) {
 	// Create a sample CurrentTimeModel
 	timeModel := CurrentTimeModel{
 		ReadableTime: "2025-05-03T12:00:00Z",
-		Time:         1746324000000, // Unix time in milliseconds
+		Time:         NewModelTime(time.UnixMilli(1746324000000)),
 	}
 
 	// Test JSON marshaling
@@ -34,8 +35,8 @@ func TestCurrentTimeModel(t *testing.T) {
 			timeModel.ReadableTime, unmarshaledModel.ReadableTime)
 	}
 
-	if unmarshaledModel.Time != timeModel.Time {
-		t.Errorf("Expected Time %d, got %d",
+	if !unmarshaledModel.Time.Equal(timeModel.Time.Time) {
+		t.Errorf("Expected Time %v, got %v",
 			timeModel.Time, unmarshaledModel.Time)
 	}
 }
@@ -44,14 +45,14 @@ func TestCurrentTimeData(t *testing.T) {
 	// Create a sample CurrentTimeData
 	entry := CurrentTimeModel{
 		ReadableTime: "2025-05-03T12:00:00Z",
-		Time:         1746324000000,
+		Time:         NewModelTime(time.UnixMilli(1746324000000)),
 	}
 
 	references := NewEmptyReferences()
 
 	timeData := CurrentTimeData{
 		Entry:      entry,
-		References: references,
+		References: *references,
 	}
 
 	// Test JSON marshaling
@@ -73,8 +74,8 @@ func TestCurrentTimeData(t *testing.T) {
 			timeData.Entry.ReadableTime, unmarshaledData.Entry.ReadableTime)
 	}
 
-	if unmarshaledData.Entry.Time != timeData.Entry.Time {
-		t.Errorf("Expected Entry.Time %d, got %d",
+	if !unmarshaledData.Entry.Time.Equal(timeData.Entry.Time.Time) {
+		t.Errorf("Expected Entry.Time %v, got %v",
 			timeData.Entry.Time, unmarshaledData.Entry.Time)
 	}
 
@@ -112,22 +113,14 @@ func TestNewCurrentTimeData(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Expected values
-			expectedMillis := tc.testTime.UnixNano() / int64(time.Millisecond)
-			expectedReadable := tc.testTime.Format(time.RFC3339)
-
-			// Call the function being tested
 			result := NewCurrentTimeData(tc.testTime)
 
 			// Verify the time fields
-			if result.Entry.Time != expectedMillis {
-				t.Errorf("Expected time %d, got %d", expectedMillis, result.Entry.Time)
-			}
-
-			if result.Entry.ReadableTime != expectedReadable {
-				t.Errorf("Expected readable time %s, got %s",
-					expectedReadable, result.Entry.ReadableTime)
-			}
+			expectedMillis := tc.testTime.UnixMilli()
+			assert.Equal(t, expectedMillis, result.Entry.Time.UnixMilli())
+			// NewCurrentTimeData formats in UTC regardless of the input location.
+			expectedReadable := tc.testTime.UTC().Format(time.RFC3339)
+			assert.Equal(t, expectedReadable, result.Entry.ReadableTime)
 
 			// Verify that references is initialized
 			if result.References.Agencies == nil {
@@ -163,7 +156,7 @@ func TestCurrentTimeDataEndToEnd(t *testing.T) {
 	}
 
 	// Unmarshal back to verify structure
-	var result map[string]interface{}
+	var result map[string]any
 	err = json.Unmarshal(jsonData, &result)
 	if err != nil {
 		t.Fatalf("Failed to unmarshal JSON: %v", err)
@@ -178,18 +171,18 @@ func TestCurrentTimeDataEndToEnd(t *testing.T) {
 		t.Errorf("Expected text 'OK', got %v", result["text"])
 	}
 
-	if version, ok := result["version"].(float64); !ok || int(version) != 2 {
-		t.Errorf("Expected version 2, got %v", result["version"])
+	if version, ok := result["version"].(float64); !ok || int(version) != APIVersion {
+		t.Errorf("Expected version %d, got %v", APIVersion, result["version"])
 	}
 
 	// Check data structure
-	data, ok := result["data"].(map[string]interface{})
+	data, ok := result["data"].(map[string]any)
 	if !ok {
 		t.Fatalf("Expected data to be an object, got %T", result["data"])
 	}
 
 	// Check entry
-	entry, ok := data["entry"].(map[string]interface{})
+	entry, ok := data["entry"].(map[string]any)
 	if !ok {
 		t.Fatalf("Expected entry to be an object, got %T", data["entry"])
 	}
@@ -213,7 +206,7 @@ func TestCurrentTimeDataEndToEnd(t *testing.T) {
 	}
 
 	// Check references
-	references, ok := data["references"].(map[string]interface{})
+	references, ok := data["references"].(map[string]any)
 	if !ok {
 		t.Fatalf("Expected references to be an object, got %T", data["references"])
 	}
@@ -221,7 +214,7 @@ func TestCurrentTimeDataEndToEnd(t *testing.T) {
 	// Check that all reference arrays are present and empty
 	referenceFields := []string{"agencies", "routes", "situations", "stopTimes", "stops", "trips"}
 	for _, field := range referenceFields {
-		arr, ok := references[field].([]interface{})
+		arr, ok := references[field].([]any)
 		if !ok {
 			t.Errorf("Expected %s to be an array, got %T", field, references[field])
 		} else if len(arr) != 0 {

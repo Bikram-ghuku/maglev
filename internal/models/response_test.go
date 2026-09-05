@@ -24,7 +24,7 @@ func TestNewResponse(t *testing.T) {
 	assert.Equal(t, testCode, response.Code, "Response code should match input")
 	assert.Equal(t, testData, response.Data, "Response data should match input")
 	assert.Equal(t, testText, response.Text, "Response text should match input")
-	assert.Equal(t, 2, response.Version, "Response version should be 2")
+	assert.Equal(t, APIVersion, response.Version, "Response version should be APIVersion")
 	assert.GreaterOrEqual(t, response.CurrentTime, currentTimeBeforeCall, "Response current time should be after or equal to time before call")
 	assert.LessOrEqual(t, response.CurrentTime, currentTimeAfterCall, "Response current time should be before or equal to time after call")
 	assert.InDelta(t, time.Now().UnixNano()/int64(time.Millisecond), response.CurrentTime, 100, "Response current time should be recent")
@@ -36,17 +36,18 @@ func TestNewEntryResponse(t *testing.T) {
 
 	clock := clock.RealClock{}
 
-	response := NewEntryResponse(entryData, references, clock)
+	response := NewEntryResponse(entryData, *references, clock)
 
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, "OK", response.Text)
-	assert.Equal(t, 2, response.Version)
+	assert.Equal(t, APIVersion, response.Version)
 	assert.InDelta(t, time.Now().UnixNano()/int64(time.Millisecond), response.CurrentTime, 100)
 
-	responseData, ok := response.Data.(map[string]interface{})
+	responseData, ok := response.Data.(map[string]any)
 	assert.True(t, ok, "Response data should be a map")
 	assert.Equal(t, entryData, responseData["entry"], "Entry in response data should match input entry")
-	assert.Equal(t, references, responseData["references"], "References in response data should match input references")
+	assert.Equal(t, *references, responseData["references"], "References in response data should match input references")
+	assert.NotContains(t, responseData, "limitExceeded", "entry responses must not include limitExceeded")
 }
 
 func TestNewOKResponse(t *testing.T) {
@@ -59,7 +60,7 @@ func TestNewOKResponse(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.Code, "Response code should be StatusOK")
 	assert.Equal(t, "OK", response.Text, "Response text should be 'OK'")
 	assert.Equal(t, testData, response.Data, "Response data should match input")
-	assert.Equal(t, 2, response.Version, "Response version should be 2")
+	assert.Equal(t, APIVersion, response.Version, "Response version should be APIVersion")
 	assert.InDelta(t, time.Now().UnixNano()/int64(time.Millisecond), response.CurrentTime, 100, "Response current time should be recent")
 }
 
@@ -69,17 +70,17 @@ func TestNewListResponse(t *testing.T) {
 
 	clock := clock.RealClock{}
 
-	response := NewListResponse(itemList, references, false, clock)
+	response := NewListResponse(itemList, *references, false, clock)
 
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, "OK", response.Text)
-	assert.Equal(t, 2, response.Version)
+	assert.Equal(t, APIVersion, response.Version)
 	assert.InDelta(t, time.Now().UnixNano()/int64(time.Millisecond), response.CurrentTime, 100)
 
-	responseData, ok := response.Data.(map[string]interface{})
+	responseData, ok := response.Data.(map[string]any)
 	assert.True(t, ok, "Response data should be a map")
 	assert.Equal(t, itemList, responseData["list"], "List in response data should match input list")
-	assert.Equal(t, references, responseData["references"], "References in response data should match input references")
+	assert.Equal(t, *references, responseData["references"], "References in response data should match input references")
 	assert.False(t, responseData["limitExceeded"].(bool), "limitExceeded should be false")
 }
 
@@ -91,17 +92,17 @@ func TestNewListResponseWithRange(t *testing.T) {
 
 	clock := clock.RealClock{}
 
-	response := NewListResponseWithRange(itemList, references, outOfRange, clock, isLimitExceeded)
+	response := NewListResponseWithRange(itemList, *references, outOfRange, clock, isLimitExceeded)
 
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, "OK", response.Text)
-	assert.Equal(t, 2, response.Version)
+	assert.Equal(t, APIVersion, response.Version)
 	assert.InDelta(t, time.Now().UnixNano()/int64(time.Millisecond), response.CurrentTime, 100)
 
-	responseData, ok := response.Data.(map[string]interface{})
+	responseData, ok := response.Data.(map[string]any)
 	assert.True(t, ok, "Response data should be a map")
 	assert.Equal(t, itemList, responseData["list"], "List in response data should match input list")
-	assert.Equal(t, references, responseData["references"], "References in response data should match input references")
+	assert.Equal(t, *references, responseData["references"], "References in response data should match input references")
 	assert.True(t, responseData["limitExceeded"].(bool), "limitExceeded should be true")
 	assert.True(t, responseData["outOfRange"].(bool), "outOfRange should be true")
 }
@@ -112,9 +113,9 @@ func TestNewListResponseWithRangeFalseFlag(t *testing.T) {
 
 	clock := clock.RealClock{}
 
-	response := NewListResponseWithRange(itemList, references, false, clock, false)
+	response := NewListResponseWithRange(itemList, *references, false, clock, false)
 
-	responseData, ok := response.Data.(map[string]interface{})
+	responseData, ok := response.Data.(map[string]any)
 	assert.True(t, ok, "Response data should be a map")
 	assert.False(t, responseData["limitExceeded"].(bool), "limitExceeded should be false")
 	assert.False(t, responseData["outOfRange"].(bool), "outOfRange should be false")
@@ -140,18 +141,18 @@ func TestNewArrivalsAndDepartureResponse(t *testing.T) {
 
 	clock := clock.RealClock{}
 
-	response := NewArrivalsAndDepartureResponse(arrivalsAndDepartures, references, nearbyStopIDs, situationIDs, stopID, clock)
+	response := NewArrivalsAndDepartureResponse(arrivalsAndDepartures, *references, nearbyStopIDs, situationIDs, stopID, clock)
 
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, "OK", response.Text)
-	assert.Equal(t, 2, response.Version)
+	assert.Equal(t, APIVersion, response.Version)
 	assert.InDelta(t, time.Now().UnixNano()/int64(time.Millisecond), response.CurrentTime, 100)
 
-	responseData, ok := response.Data.(map[string]interface{})
+	responseData, ok := response.Data.(map[string]any)
 	assert.True(t, ok, "Response data should be a map")
-	assert.Equal(t, references, responseData["references"], "References in response data should match input references")
+	assert.Equal(t, *references, responseData["references"], "References in response data should match input references")
 
-	entryData, ok := responseData["entry"].(map[string]interface{})
+	entryData, ok := responseData["entry"].(map[string]any)
 	assert.True(t, ok, "Entry should be a map")
 	assert.Equal(t, arrivalsAndDepartures, entryData["arrivalsAndDepartures"])
 	assert.Equal(t, nearbyStopIDs, entryData["nearbyStopIds"])
@@ -168,12 +169,12 @@ func TestNewArrivalsAndDepartureResponseEmptyArrays(t *testing.T) {
 
 	clock := clock.RealClock{}
 
-	response := NewArrivalsAndDepartureResponse(arrivalsAndDepartures, references, nearbyStopIDs, situationIDs, stopID, clock)
+	response := NewArrivalsAndDepartureResponse(arrivalsAndDepartures, *references, nearbyStopIDs, situationIDs, stopID, clock)
 
-	responseData, ok := response.Data.(map[string]interface{})
+	responseData, ok := response.Data.(map[string]any)
 	assert.True(t, ok, "Response data should be a map")
 
-	entryData, ok := responseData["entry"].(map[string]interface{})
+	entryData, ok := responseData["entry"].(map[string]any)
 	assert.True(t, ok, "Entry should be a map")
 	assert.Empty(t, entryData["arrivalsAndDepartures"], "arrivalsAndDepartures should be empty")
 	assert.Empty(t, entryData["nearbyStopIds"], "nearbyStopIds should be empty")
@@ -188,7 +189,7 @@ func TestResponseModelJSON(t *testing.T) {
 		CurrentTime: 1746324484528,
 		Data:        map[string]string{"test": "data"},
 		Text:        "Test Message",
-		Version:     2,
+		Version:     APIVersion,
 	}
 
 	// Marshal to JSON
@@ -223,7 +224,7 @@ func TestResponseModelJSON(t *testing.T) {
 	}
 
 	// Check that data was correctly marshaled/unmarshaled
-	responseData, ok := unmarshaledResponse.Data.(map[string]interface{})
+	responseData, ok := unmarshaledResponse.Data.(map[string]any)
 	if !ok {
 		t.Error("Failed to cast unmarshaled response data to map[string]interface{}")
 	} else {

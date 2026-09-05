@@ -2,7 +2,7 @@ package models
 
 type Trip struct {
 	BlockID        string `json:"blockId"`
-	DirectionID    int64  `json:"directionId"`
+	DirectionID    string `json:"directionId"`
 	ID             string `json:"id"`
 	RouteID        string `json:"routeId"`
 	ServiceID      string `json:"serviceId"`
@@ -10,7 +10,7 @@ type Trip struct {
 	TripHeadsign   string `json:"tripHeadsign"`
 	TripShortName  string `json:"tripShortName"`
 	RouteShortName string `json:"routeShortName"`
-	PeakOffPeak    int64  `json:"peakOffPeak"`
+	PeakOffPeak    int64  `json:"peakOffpeak"`
 	TimeZone       string `json:"timeZone"`
 }
 
@@ -24,7 +24,7 @@ func NewTripResponse(trip *Trip, timeZone string, peakOffPeak int) *TripResponse
 	}
 }
 
-func NewTripReference(id, routeID, serviceID, headSign, shortName string, directionID int64, blockID, shapeID string) *Trip {
+func NewTripReference(id, routeID, serviceID, headSign, shortName string, directionID string, blockID, shapeID string) *Trip {
 	return &Trip{
 		BlockID:        blockID,
 		DirectionID:    directionID,
@@ -41,7 +41,7 @@ func NewTripReference(id, routeID, serviceID, headSign, shortName string, direct
 }
 
 type TripsSchedule struct {
-	Frequency      *int64     `json:"frequency"`
+	Frequency      *Frequency `json:"frequency"`
 	NextTripId     string     `json:"nextTripId"`
 	PreviousTripId string     `json:"previousTripId"`
 	StopTimes      []StopTime `json:"stopTimes"`

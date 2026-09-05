@@ -1,93 +1,105 @@
 package restapi
 
 import (
+	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 
-	"github.com/OneBusAway/go-gtfs"
 	"maglev.onebusaway.org/gtfsdb"
 	"maglev.onebusaway.org/internal/models"
+	"maglev.onebusaway.org/internal/nulls"
 	"maglev.onebusaway.org/internal/utils"
 )
 
-// Pre-compiled regex patterns for FTS5 query sanitization
-var (
-	fts5SpecialCharsRegex = regexp.MustCompile(`[*"():^$@#~<>{}[\]\\|&!]`)
-	fts5OperatorsRegex    = regexp.MustCompile(`(?i)\b(AND|OR|NOT|NEAR)\b`)
+// Pre-compiled regex pattern for FTS5 query sanitization
+var fts5SpecialCharsRegex = regexp.MustCompile(`[*"():^$@#~<>{}[\]\\|&!]`)
+
+// GTFS extended special-vehicle route types. A stop served by exactly one route of
+// one of these types is excluded from stop search results.
+const (
+	routeTypeShuttleBus                int64 = 711
+	routeTypeSchoolBus                 int64 = 712
+	routeTypeSchoolAndPublicServiceBus int64 = 713
+	routeTypeRailReplacementBus        int64 = 714
 )
+
+// isSpecialVehicleRouteType reports whether a GTFS route type denotes a special
+// vehicle service that does not qualify a stop for stop search results on its own.
+func isSpecialVehicleRouteType(routeType int64) bool {
+	switch routeType {
+	case routeTypeShuttleBus, routeTypeSchoolBus, routeTypeSchoolAndPublicServiceBus, routeTypeRailReplacementBus:
+		return true
+	}
+	return false
+}
 
 // sanitizeFTS5Query removes special FTS5 characters by replacing them with spaces
 // to prevent query syntax errors. Does not preserve the original characters.
+//
+// Operator words (AND, OR, NOT, NEAR) are deliberately left intact: every term is wrapped
+// in double quotes before the query is assembled, so FTS5 reads them as literal tokens
+// rather than syntax. Stripping them made stop names containing those words unsearchable.
 func sanitizeFTS5Query(input string) string {
-	// 1. Remove ALL FTS5 special characters using pre-compiled regex
 	sanitized := fts5SpecialCharsRegex.ReplaceAllString(input, " ")
-
-	// 2. Remove FTS5 operators using pre-compiled regex
-	sanitized = fts5OperatorsRegex.ReplaceAllString(sanitized, " ")
-
-	// 3. Trim and collapse whitespace
 	sanitized = strings.TrimSpace(sanitized)
-	sanitized = strings.Join(strings.Fields(sanitized), " ")
 
-	return sanitized
+	return strings.Join(strings.Fields(sanitized), " ")
 }
 
+// extractFTS5Terms splits sanitized input into terms and filters out stray punctuation
+// (such as "/" or "-") that FTS5 tokenizes to nothing and would otherwise cause syntax errors.
+func extractFTS5Terms(sanitizedQuery string) []string {
+	rawTerms := strings.Fields(sanitizedQuery)
+	terms := make([]string, 0, len(rawTerms))
+	for _, term := range rawTerms {
+		if utils.ContainsLetterOrDigit(term) {
+			terms = append(terms, term)
+		}
+	}
+	return terms
+}
+
+// searchStopsHandler searches for stops matching a user-provided query string
+// using full-text search, with optional geographic bounds filtering.
 func (api *RestAPI) searchStopsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// 1. Parse Parameters
-	query := r.URL.Query().Get("input")
-	if query == "" {
-		api.validationErrorResponse(w, r, map[string][]string{"input": {"required"}})
+	queryParams := r.URL.Query()
+	fieldErrors := make(map[string][]string)
+
+	includeReferences := ShouldIncludeReferences(r)
+
+	// Standardized parameter parsing
+	query, fieldErrors := utils.ParseRequiredStringParam(queryParams, "input", fieldErrors)
+	limit, fieldErrors := utils.ParseMaxCount(queryParams, 20, fieldErrors)
+	if len(fieldErrors) > 0 {
+		api.validationErrorResponse(w, r, fieldErrors)
 		return
-	}
-
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
-	limit := 50
-	if maxCountStr := r.URL.Query().Get("maxCount"); maxCountStr != "" {
-		if parsed, err := strconv.Atoi(maxCountStr); err == nil && parsed > 0 {
-			limit = parsed
-		}
 	}
 
 	// 2. Sanitize and construct FTS5 query
 	sanitizedQuery := sanitizeFTS5Query(query)
+	terms := extractFTS5Terms(sanitizedQuery)
 
-	if sanitizedQuery == "" {
-		data := struct {
-			LimitExceeded bool                   `json:"limitExceeded"`
-			List          []models.Stop          `json:"list"`
-			OutOfRange    bool                   `json:"outOfRange"`
-			References    models.ReferencesModel `json:"references"`
-		}{
-			LimitExceeded: false,
-			List:          []models.Stop{},
-			OutOfRange:    false,
-			References:    models.NewEmptyReferences(),
-		}
-
-		response := models.ResponseModel{
-			Code:        200,
-			CurrentTime: models.ResponseCurrentTime(api.Clock),
-			Version:     2,
-			Text:        "OK",
-			Data:        data,
-		}
-
+	if len(terms) == 0 {
+		response := models.NewListResponseWithRange([]models.Stop{}, *models.NewEmptyReferences(), false, api.Clock, false)
 		api.sendResponse(w, r, response)
 		return
 	}
 
-	searchQuery := `"` + sanitizedQuery + `*"`
+	queryTerms := make([]string, len(terms))
+	for i, term := range terms {
+		queryTerms[i] = `"` + term + `"*`
+	}
+	searchQuery := strings.Join(queryTerms, " AND ")
 
 	searchParams := gtfsdb.SearchStopsByNameParams{
 		SearchQuery: searchQuery,
-		Limit:       int64(limit),
+		Limit:       int64(limit + 1), // Request limit + 1 to accurately determine if pagination boundaries are exceeded.
 	}
 
 	// 3. Perform Full Text Search (with logged fallback)
@@ -104,7 +116,12 @@ func (api *RestAPI) searchStopsHandler(w http.ResponseWriter, r *http.Request) {
 				"sanitized_input", sanitizedQuery,
 			)
 
-			searchQuery = `"` + sanitizedQuery + `"`
+			fallbackTerms := make([]string, len(terms))
+			for i, term := range terms {
+				fallbackTerms[i] = `"` + term + `"`
+			}
+			searchQuery = strings.Join(fallbackTerms, " AND ")
+
 			searchParams.SearchQuery = searchQuery
 
 			stops, err = api.GtfsManager.GtfsDB.Queries.SearchStopsByName(ctx, searchParams)
@@ -126,6 +143,8 @@ func (api *RestAPI) searchStopsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	stops, isLimitExceeded := utils.PaginateSlice(stops, 0, limit)
+
 	// 4. Batch Fetch Related Data
 	stopIDs := make([]string, len(stops))
 	for i, s := range stops {
@@ -146,177 +165,146 @@ func (api *RestAPI) searchStopsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 5. Organize Data
 	routesByStopID := make(map[string][]string)
-	routesMap := make(map[string]models.Route)
+	routeTypes := make(map[string]int64)
 
 	for _, row := range routesRows {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
 		combinedRouteID := utils.FormCombinedID(row.AgencyID, row.ID)
-
 		routesByStopID[row.StopID] = append(routesByStopID[row.StopID], combinedRouteID)
-
-		if _, exists := routesMap[combinedRouteID]; !exists {
-
-			shortName := ""
-			if row.ShortName.Valid {
-				shortName = row.ShortName.String
-			}
-
-			longName := ""
-			if row.LongName.Valid {
-				longName = row.LongName.String
-			}
-
-			desc := ""
-			if row.Desc.Valid {
-				desc = row.Desc.String
-			}
-
-			url := ""
-			if row.Url.Valid {
-				url = row.Url.String
-			}
-
-			color := ""
-			if row.Color.Valid {
-				color = row.Color.String
-			}
-
-			textColor := ""
-			if row.TextColor.Valid {
-				textColor = row.TextColor.String
-			}
-
-			routesMap[combinedRouteID] = models.NewRoute(
-				combinedRouteID,
-				row.AgencyID,
-				shortName,
-				longName,
-				desc,
-				models.RouteType(row.Type),
-				url,
-				color,
-				textColor)
-
-		}
-	}
-
-	agenciesMap := make(map[string]models.AgencyReference)
-	for _, row := range agencyRows {
-		if _, exists := agenciesMap[row.ID]; !exists {
-			agenciesMap[row.ID] = models.NewAgencyReference(
-				row.ID,
-				row.Name,
-				row.Url,
-				row.Timezone,
-				row.Lang.String,
-				row.Phone.String,
-				row.Email.String,
-				row.FareUrl.String,
-				"",
-				false,
-			)
-		}
+		routeTypes[combinedRouteID] = row.Type
 	}
 
 	// 6. Construct Stop Models
 	stopModels := make([]models.Stop, 0, len(stops))
+	parentIDsByAgency := make(map[string][]string)
+	keptStopIDs := make([]string, 0, len(stops))
+	keptStopsSet := make(map[string]bool)
 
 	for _, s := range stops {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
-		var agencyID string
-
-		if rts, ok := routesByStopID[s.ID]; ok && len(rts) > 0 {
-			agencyID, _, _ = utils.ExtractAgencyIDAndCodeID(rts[0])
-		} else if len(agenciesMap) == 1 {
-			for id := range agenciesMap {
-				agencyID = id
-				break
-			}
-		}
-
-		var combinedStopID string
-		if agencyID != "" {
-			combinedStopID = utils.FormCombinedID(agencyID, s.ID)
-		} else {
-			combinedStopID = s.ID
-		}
-
 		routeIDs := routesByStopID[s.ID]
-		if routeIDs == nil {
-			routeIDs = []string{}
+		if len(routeIDs) == 0 {
+			continue
 		}
 
-		name := ""
-		if s.Name.Valid {
-			name = s.Name.String
+		// Legacy behaviour: only stops with exactly one route are type-filtered
+		if len(routeIDs) == 1 && isSpecialVehicleRouteType(routeTypes[routeIDs[0]]) {
+			continue
 		}
 
-		code := ""
-		if s.Code.Valid {
-			code = s.Code.String
-		}
+		// The search query resolves this from the precomputed index, so the stop's combined
+		// ID here matches the key the results were sorted by.
+		agencyID := nulls.StringOrEmpty(s.AgencyID)
 
-		direction := ""
-		if s.Direction.Valid {
-			direction = s.Direction.String
-		}
+		stopModels = append(stopModels, api.buildSearchStopModel(ctx, agencyID, stopFromSearchRow(s), routeIDs))
+		keptStopIDs = append(keptStopIDs, s.ID)
+		keptStopsSet[s.ID] = true
 
-		parentStation := ""
-		if s.ParentStation.Valid {
-			parentStation = s.ParentStation.String
+		if parentID := nulls.StringOrEmpty(s.ParentStation); parentID != "" {
+			parentIDsByAgency[agencyID] = append(parentIDsByAgency[agencyID], parentID)
 		}
-
-		stopModel := models.Stop{
-			ID:                 combinedStopID,
-			Name:               name,
-			Lat:                s.Lat,
-			Lon:                s.Lon,
-			Code:               code,
-			Direction:          direction,
-			LocationType:       int(s.LocationType.Int64),
-			WheelchairBoarding: utils.MapWheelchairBoarding(gtfs.WheelchairBoarding(s.WheelchairBoarding.Int64)),
-			RouteIDs:           routeIDs,
-			StaticRouteIDs:     routeIDs,
-			Parent:             parentStation,
-		}
-
-		stopModels = append(stopModels, stopModel)
 	}
 
 	// 7. Build References
 	references := models.NewEmptyReferences()
-	for _, r := range routesMap {
-		references.Routes = append(references.Routes, r)
-	}
-	for _, a := range agenciesMap {
-		references.Agencies = append(references.Agencies, a)
+	if includeReferences {
+		keptRoutesRows := make([]gtfsdb.GetRoutesForStopsRow, 0, len(routesRows))
+		for _, row := range routesRows {
+			if keptStopsSet[row.StopID] {
+				keptRoutesRows = append(keptRoutesRows, row)
+			}
+		}
+		keptAgencyRows := make([]gtfsdb.GetAgenciesForStopsRow, 0, len(agencyRows))
+		for _, row := range agencyRows {
+			if keptStopsSet[row.StopID] {
+				keptAgencyRows = append(keptAgencyRows, row)
+			}
+		}
+		references.Agencies = agencyReferencesForStops(keptAgencyRows)
+
+		// Populate situation references for alerts affecting the returned stops
+		alerts := api.collectAlertsForStops(keptStopIDs)
+		situations := api.BuildSituationReferences(alerts)
+		references.Situations = append(references.Situations, situations...)
+
+		var parentRoutes map[string]gtfsdb.GetRoutesForStopsRow
+		references.Stops, parentRoutes, err = api.buildSearchParentStationReferences(ctx, parentIDsByAgency)
+		if err != nil {
+			api.serverErrorResponse(w, r, fmt.Errorf("failed to fetch parent stops: %w", err))
+			return
+		}
+		utils.SortModelStopsByID(references.Stops)
+
+		// Append missing agencies from parent routes to references.Agencies
+		existingAgencies := make(map[string]bool)
+		for _, agency := range references.Agencies {
+			existingAgencies[agency.ID] = true
+		}
+		for _, row := range parentRoutes {
+			if !existingAgencies[row.AgencyID] {
+				api.appendRouteAgencyReference(ctx, references, row.AgencyID, "")
+				existingAgencies[row.AgencyID] = true
+			}
+		}
+		utils.SortAgencyReferencesByID(references.Agencies)
+
+		references.Routes = mergeParentRouteReferences(routeReferencesForStops(keptRoutesRows), parentRoutes)
+		utils.SortModelRoutesByName(references.Routes)
 	}
 
-	data := struct {
-		LimitExceeded bool                   `json:"limitExceeded"`
-		List          []models.Stop          `json:"list"`
-		OutOfRange    bool                   `json:"outOfRange"`
-		References    models.ReferencesModel `json:"references"`
-	}{
-		LimitExceeded: len(stops) >= limit,
-		List:          stopModels,
-		OutOfRange:    false,
-		References:    references,
-	}
-
-	response := models.ResponseModel{
-		Code:        200,
-		CurrentTime: models.ResponseCurrentTime(api.Clock),
-		Version:     2,
-		Text:        "OK",
-		Data:        data,
-	}
-
+	response := models.NewListResponseWithRange(stopModels, *references, false, api.Clock, isLimitExceeded)
 	api.sendResponse(w, r, response)
+}
+
+// stopFromSearchRow converts a full-text search result row into the stop record the
+// shared reference builders operate on.
+func stopFromSearchRow(row gtfsdb.SearchStopsByNameRow) gtfsdb.Stop {
+	return gtfsdb.Stop{
+		ID:                 row.ID,
+		Code:               row.Code,
+		Name:               row.Name,
+		Lat:                row.Lat,
+		Lon:                row.Lon,
+		LocationType:       row.LocationType,
+		WheelchairBoarding: row.WheelchairBoarding,
+		Direction:          row.Direction,
+		ParentStation:      row.ParentStation,
+	}
+}
+
+// buildSearchStopModel builds a stop model for a search result, adding the parent
+// station field that the shared buildStopModel does not set.
+func (api *RestAPI) buildSearchStopModel(ctx context.Context, agencyID string, stop gtfsdb.Stop, combinedRouteIDs []string) models.Stop {
+	stopModel := api.buildStopModel(ctx, agencyID, stop, combinedRouteIDs)
+	stopModel.Parent = utils.FormCombinedID(agencyID, nulls.StringOrEmpty(stop.ParentStation))
+	return stopModel
+}
+
+// buildSearchParentStationReferences resolves parent stations into references, emitting one
+// entry per (parent station, agency) pair referenced by the result set so that every
+// non-empty parent value in the returned list has a matching reference. It also returns
+// the unique routes serving those parent stations, keyed the same way their routeIds are,
+// so callers can merge them into references.routes.
+func (api *RestAPI) buildSearchParentStationReferences(ctx context.Context, parentIDsByAgency map[string][]string) ([]models.Stop, map[string]gtfsdb.GetRoutesForStopsRow, error) {
+	parentRefs := make([]models.Stop, 0, len(parentIDsByAgency))
+	parentRoutes := make(map[string]gtfsdb.GetRoutesForStopsRow)
+
+	for agencyID, parentIDs := range parentIDsByAgency {
+		refs, routes, err := BuildStopReferencesAndRouteIDsForStops(api, ctx, agencyID, parentIDs)
+		if err != nil {
+			return nil, nil, err
+		}
+		parentRefs = append(parentRefs, refs...)
+		maps.Copy(parentRoutes, routes)
+	}
+
+	return parentRefs, parentRoutes, nil
 }

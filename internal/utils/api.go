@@ -1,9 +1,8 @@
 package utils
 
 import (
-	"context"
+	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OneBusAway/go-gtfs"
+	"maglev.onebusaway.org/internal/clock"
 	"maglev.onebusaway.org/internal/models"
 )
 
@@ -19,25 +19,53 @@ func CalculateServiceDate(currentTime time.Time) time.Time {
 	return time.Date(year, month, day, 0, 0, 0, 0, currentTime.Location())
 }
 
-func ServiceDateMillis(explicitServiceDate *time.Time, currentTime time.Time) (time.Time, int64) {
+func ServiceDateMidnight(explicitServiceDate *time.Time, currentTime time.Time) (time.Time, time.Time) {
 	var serviceDate time.Time
 	if explicitServiceDate != nil {
 		serviceDate = *explicitServiceDate
 	} else {
 		serviceDate = CalculateServiceDate(currentTime)
 	}
-	return serviceDate, serviceDate.Unix() * 1000
+	// Always return midnight of the service date in the date's own timezone.
+	// This ensures all endpoints return a consistent serviceDate millis value.
+	midnight := time.Date(serviceDate.Year(), serviceDate.Month(), serviceDate.Day(),
+		0, 0, 0, 0, serviceDate.Location())
+	return serviceDate, midnight
 }
 
+// CalculateSecondsSinceServiceDate returns the number of wall-clock seconds elapsed
+// since the start of the service date (midnight in the agency's timezone).
+//
+// Wall-clock seconds are used intentionally: GTFS stop_time values are stored as
+// plain seconds-since-midnight offsets with no DST awareness. Using real elapsed
+// seconds (time.Sub) would diverge from GTFS by 3600 s during the DST fallback
+// ambiguous hour (e.g. when 1:30 AM occurs twice), causing wrong closest-stop
+// selections and schedule offsets. Wall-clock math keeps the two in sync.
+//
+// The day difference is computed using UTC-normalised calendar dates to avoid any
+// DST interference in the date arithmetic itself, which correctly handles overnight
+// and post-midnight trips (GTFS allows stop times > 24:00:00).
 func CalculateSecondsSinceServiceDate(currentTime time.Time, serviceDate time.Time) int64 {
-	duration := currentTime.Sub(serviceDate)
-	return int64(duration.Seconds())
+	loc := serviceDate.Location()
+	t := currentTime.In(loc)
+	h, m, s := t.Clock()
+	wallSeconds := int64(h*3600 + m*60 + s)
+
+	// Normalise both calendar dates to UTC midnight so that the subtraction is
+	// purely a date difference with no DST offset interference.
+	syear, smonth, sday := serviceDate.In(loc).Date()
+	tyear, tmonth, tday := t.Date()
+	sd := time.Date(syear, smonth, sday, 0, 0, 0, 0, time.UTC)
+	td := time.Date(tyear, tmonth, tday, 0, 0, 0, 0, time.UTC)
+	dayDiff := int64(td.Sub(sd).Hours() / 24)
+
+	return wallSeconds + dayDiff*86400
 }
 
 // Converts a GTFS stop-time value (stored as nanoseconds in db since midnight)
 // to seconds since midnight.
 func NanosToSeconds(nanos int64) int64 {
-	return nanos / 1e9
+	return int64(time.Duration(nanos) / time.Second)
 }
 
 // EffectiveStopTimeSeconds returns the effective stop time in seconds since midnight,
@@ -45,9 +73,9 @@ func NanosToSeconds(nanos int64) int64 {
 // Both inputs are nanoseconds since midnight (the GTFS database storage format).
 func EffectiveStopTimeSeconds(arrivalTimeNanos, departureTimeNanos int64) int64 {
 	if arrivalTimeNanos > 0 {
-		return arrivalTimeNanos / 1e9
+		return int64(time.Duration(arrivalTimeNanos) / time.Second)
 	}
-	return departureTimeNanos / 1e9
+	return int64(time.Duration(departureTimeNanos) / time.Second)
 }
 
 // ExtractCodeID extracts the `code_id` from a string in the format `{agency_id}_{code_id}`.
@@ -122,10 +150,30 @@ func ParseFloatParam(params url.Values, key string, fieldErrors map[string][]str
 	return f, fieldErrors
 }
 
-func ParseTimeParameter(timeParam string, currentLocation *time.Location) (string, time.Time, map[string][]string, bool) {
+func ParseRequiredFloatParam(params url.Values, key string, fieldErrors map[string][]string) (float64, map[string][]string) {
+	if fieldErrors == nil {
+		fieldErrors = make(map[string][]string)
+	}
+
+	val := params.Get(key)
+	if val == "" {
+		fieldErrors[key] = append(fieldErrors[key], fmt.Sprintf("Missing required field %q.", key))
+		return 0, fieldErrors
+	}
+
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		fieldErrors[key] = append(fieldErrors[key], fmt.Sprintf("Invalid field value for field %q.", key))
+		return 0, fieldErrors
+	}
+	return f, fieldErrors
+
+}
+
+func ParseTimeParameter(timeParam string, currentLocation *time.Location, c clock.Clock) (string, time.Time, map[string][]string, bool) {
 	if timeParam == "" {
-		// No time parameter, use current date
-		now := time.Now().In(currentLocation)
+		// No time parameter, use the provided clock's current time
+		now := c.Now().In(currentLocation)
 		return now.Format("20060102"), now, nil, true
 	}
 
@@ -138,9 +186,16 @@ func ParseTimeParameter(timeParam string, currentLocation *time.Location) (strin
 		parsedTime = time.Unix(epochTime/1000, 0).In(currentLocation)
 		validFormat = true
 	} else if strings.Contains(timeParam, "-") {
-		// Assume YYYY-MM-DD format
-		parsedTime, err = time.Parse("2006-01-02", timeParam)
+		// Try yyyy-MM-dd_HH-mm-ss first (e.g. "2024-03-15_12-00-00")
+		parsed, err := time.ParseInLocation("2006-01-02_15-04-05", timeParam, currentLocation)
+		if err != nil {
+			// If it fails, fall back to yyyy-MM-dd (e.g. "2024-03-15")
+			parsed, err = time.ParseInLocation("2006-01-02", timeParam, currentLocation)
+		}
+
+		// If either parsing attempt succeeded, apply the result
 		if err == nil {
+			parsedTime = parsed
 			validFormat = true
 		}
 	}
@@ -157,22 +212,28 @@ func ParseTimeParameter(timeParam string, currentLocation *time.Location) (strin
 	return parsedTime.Format("20060102"), parsedTime, nil, true
 }
 
-func LoadLocationWithUTCFallBack(timeZone string, agencyId string) *time.Location {
-	loc, err := time.LoadLocation(timeZone)
-	if err != nil {
-		slog.Warn("invalid agency timezone, using UTC",
-			slog.String("agencyID", agencyId),
-			slog.String("timezone", timeZone),
-			slog.String("error", err.Error()))
-		loc = time.UTC
-	}
-	return loc
-}
+// maxCountOverflow selects how values above models.MaxAllowedCount are handled.
+type maxCountOverflow int
+
+const (
+	rejectAboveMax maxCountOverflow = iota
+	clampAboveMax
+)
 
 // ParseMaxCount parses the maxCount query parameter with validation.
-// It accepts a default value and enforces a maximum of 250 (matching Java's MaxCountSupport).
-// Returns an error in fieldErrors if the value is <= 0 or > 250.
+// It accepts a default value and enforces models.MaxAllowedCount as the ceiling.
+// Returns an error in fieldErrors if the value is <= 0 or above the ceiling.
 func ParseMaxCount(queryParams url.Values, defaultCount int, fieldErrors map[string][]string) (int, map[string][]string) {
+	return parseMaxCount(queryParams, defaultCount, rejectAboveMax, fieldErrors)
+}
+
+// ParseMaxCountClamped silently clamps values above models.MaxAllowedCount
+// instead of rejecting them. Values <= 0 are still field errors.
+func ParseMaxCountClamped(queryParams url.Values, defaultCount int, fieldErrors map[string][]string) (int, map[string][]string) {
+	return parseMaxCount(queryParams, defaultCount, clampAboveMax, fieldErrors)
+}
+
+func parseMaxCount(queryParams url.Values, defaultCount int, overflow maxCountOverflow, fieldErrors map[string][]string) (int, map[string][]string) {
 	if fieldErrors == nil {
 		fieldErrors = make(map[string][]string)
 	}
@@ -186,55 +247,18 @@ func ParseMaxCount(queryParams url.Values, defaultCount int, fieldErrors map[str
 				fieldErrors["maxCount"] = []string{"must be greater than zero"}
 				maxCount = defaultCount
 			} else if maxCount > models.MaxAllowedCount {
-				fieldErrors["maxCount"] = []string{"must not exceed 250"}
-				maxCount = defaultCount
+				if overflow == clampAboveMax {
+					maxCount = models.MaxAllowedCount
+				} else {
+					fieldErrors["maxCount"] = []string{fmt.Sprintf("must not exceed %d", models.MaxAllowedCount)}
+					maxCount = defaultCount
+				}
 			}
 		} else {
 			fieldErrors["maxCount"] = []string{"Invalid field value for field \"maxCount\"."}
 		}
 	}
 	return maxCount, fieldErrors
-}
-
-// a custom type for context keys to avoid collisions
-type contextKey string
-
-const (
-	// ContextKeyID is the key for the raw validated ID
-	ContextKeyID contextKey = "validated_id"
-	// ContextKeyParsedID is the key for the split AgencyID/CodeID struct
-	ContextKeyParsedID contextKey = "parsed_id"
-)
-
-// ParsedID holds the components of a combined ID
-type ParsedID struct {
-	CombinedID string
-	AgencyID   string
-	CodeID     string
-}
-
-// WithValidatedID returns a new context with the validated ID
-func WithValidatedID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, ContextKeyID, id)
-}
-
-// GetIDFromContext retrieves the validated ID from the context
-func GetIDFromContext(ctx context.Context) (string, bool) {
-	id, ok := ctx.Value(ContextKeyID).(string)
-	return id, ok
-}
-
-// WithParsedID returns a new context with the parsed ID components
-func WithParsedID(ctx context.Context, parsed ParsedID) context.Context {
-	return context.WithValue(ctx, ContextKeyParsedID, parsed)
-}
-
-// GetParsedIDFromContext retrieves the parsed ID components from the context.
-// Handlers using this function can assume the ID has already been pre-validated
-// and safely parsed by the ID middleware.
-func GetParsedIDFromContext(ctx context.Context) (ParsedID, bool) {
-	parsed, ok := ctx.Value(ContextKeyParsedID).(ParsedID)
-	return parsed, ok
 }
 
 // ParsePaginationParams parses offset and limit from request parameters.
@@ -317,4 +341,79 @@ func ValidateNumericParam(s string) string {
 		return ""
 	}
 	return s
+}
+
+const (
+	minUnixMillis = int64(0)
+	maxUnixMillis = int64(32503680000000) // year 3000
+)
+
+// ParseDate parses date strings in YYYY-MM-DD format or as a Unix millisecond integer.
+// It returns a time.Time set to midnight (start of day) in the provided location.
+func ParseDate(date string, loc *time.Location) (time.Time, error) {
+	if date == "" {
+		return time.Time{}, errors.New("date cannot be empty")
+	}
+
+	// Parsing as an integer (Unix milliseconds)
+	if v, err := strconv.ParseInt(date, 10, 64); err == nil {
+		if v < minUnixMillis || v > maxUnixMillis {
+			return time.Time{}, errors.New("unix millisecond timestamp out of reasonable bounds")
+		}
+		// Convert to the provided timezone and explicitly set to midnight
+		t := time.UnixMilli(v).In(loc)
+		y, m, d := t.Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, loc), nil
+	}
+
+	// Parsing in YYYY-MM-DD format
+	if parsedDate, err := time.ParseInLocation("2006-01-02", date, loc); err == nil {
+		return parsedDate, nil
+	}
+
+	return time.Time{}, errors.New("invalid date format, use YYYY-MM-DD or a Unix millisecond integer")
+}
+
+// ParseRequiredStringParam retrieves a required string parameter.
+// Returns the value and a populated error map if missing.
+func ParseRequiredStringParam(params url.Values, key string, fieldErrors map[string][]string) (string, map[string][]string) {
+	if fieldErrors == nil {
+		fieldErrors = make(map[string][]string)
+	}
+
+	val := params.Get(key)
+	if val == "" {
+		fieldErrors[key] = append(fieldErrors[key], fmt.Sprintf("Missing required field %q.", key))
+	}
+	return val, fieldErrors
+}
+
+// ParseBoolParam retrieves a boolean value from the provided URL query parameters,
+// falling back to fallback when the key is absent. A value that is not a boolean
+// records a field error and leaves the fallback in place.
+func ParseBoolParam(params url.Values, key string, fallback bool, fieldErrors map[string][]string) (bool, map[string][]string) {
+	if fieldErrors == nil {
+		fieldErrors = make(map[string][]string)
+	}
+
+	val := params.Get(key)
+	if val == "" {
+		return fallback, fieldErrors
+	}
+
+	parsed, err := strconv.ParseBool(val)
+	if err != nil {
+		fieldErrors[key] = append(fieldErrors[key], "must be a boolean value (true/false)")
+		return fallback, fieldErrors
+	}
+
+	return parsed, fieldErrors
+}
+
+// ClampRadius restricts a radius value to MaxSearchRadiusInMeters
+func ClampRadius(radius float64) float64 {
+	if radius > models.MaxSearchRadiusInMeters {
+		return models.MaxSearchRadiusInMeters
+	}
+	return radius
 }

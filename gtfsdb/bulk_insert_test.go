@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // CGo-based SQLite driver
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"maglev.onebusaway.org/internal/appconf"
+	"maglev.onebusaway.org/internal/nulls"
 )
 
 func TestBulkInsertStopTimes(t *testing.T) {
@@ -36,7 +36,7 @@ func TestBulkInsertStopTimes(t *testing.T) {
 	_, err = client.Queries.CreateRoute(ctx, CreateRouteParams{
 		ID:        "test_route",
 		AgencyID:  "test_agency",
-		ShortName: sql.NullString{String: "TEST", Valid: true},
+		ShortName: nulls.String("TEST"),
 		Type:      3,
 	})
 	require.NoError(t, err)
@@ -58,7 +58,7 @@ func TestBulkInsertStopTimes(t *testing.T) {
 	// Create a test stop
 	_, err = client.Queries.CreateStop(ctx, CreateStopParams{
 		ID:   "stop_1",
-		Name: sql.NullString{String: "Test Stop", Valid: true},
+		Name: nulls.String("Test Stop"),
 		Lat:  40.0,
 		Lon:  -74.0,
 	})
@@ -69,7 +69,7 @@ func TestBulkInsertStopTimes(t *testing.T) {
 		ID:           "test_trip",
 		RouteID:      "test_route",
 		ServiceID:    "test_service",
-		TripHeadsign: sql.NullString{String: "Test", Valid: true},
+		TripHeadsign: nulls.String("Test"),
 	})
 	require.NoError(t, err)
 
@@ -107,7 +107,7 @@ func TestBulkInsertStopTimes(t *testing.T) {
 			}
 
 			// Perform bulk insert
-			err = client.bulkInsertStopTimes(ctx, stopTimes)
+			err = client.bulkInsertStopTimes(ctx, stopTimes, nil)
 			require.NoError(t, err, "Bulk insert should succeed")
 
 			// Verify all records were inserted
@@ -177,7 +177,7 @@ func TestBulkInsertShapes(t *testing.T) {
 			}
 
 			// Perform bulk insert
-			err = client.bulkInsertShapes(ctx, shapes)
+			err = client.bulkInsertShapes(ctx, shapes, nil)
 			require.NoError(t, err, "Bulk insert should succeed")
 
 			// Verify all records were inserted
@@ -235,7 +235,7 @@ func TestBulkInsertWithNullValues(t *testing.T) {
 		},
 	}
 
-	err = client.bulkInsertShapes(ctx, shapes)
+	err = client.bulkInsertShapes(ctx, shapes, nil)
 	require.NoError(t, err, "Should handle NULL values")
 
 	// Verify NULL was inserted correctly
@@ -280,7 +280,7 @@ func TestBulkInsertPerformance(t *testing.T) {
 	_, err = client.Queries.CreateRoute(ctx, CreateRouteParams{
 		ID:        "perf_route",
 		AgencyID:  "perf_agency",
-		ShortName: sql.NullString{String: "PERF", Valid: true},
+		ShortName: nulls.String("PERF"),
 		Type:      3,
 	})
 	require.NoError(t, err)
@@ -302,7 +302,7 @@ func TestBulkInsertPerformance(t *testing.T) {
 	// Create a test stop
 	_, err = client.Queries.CreateStop(ctx, CreateStopParams{
 		ID:   "stop_1",
-		Name: sql.NullString{String: "Performance Test Stop", Valid: true},
+		Name: nulls.String("Performance Test Stop"),
 		Lat:  40.0,
 		Lon:  -74.0,
 	})
@@ -313,7 +313,7 @@ func TestBulkInsertPerformance(t *testing.T) {
 		ID:           "perf_trip",
 		RouteID:      "perf_route",
 		ServiceID:    "perf_service",
-		TripHeadsign: sql.NullString{String: "Performance", Valid: true},
+		TripHeadsign: nulls.String("Performance"),
 	})
 	require.NoError(t, err)
 
@@ -334,7 +334,7 @@ func TestBulkInsertPerformance(t *testing.T) {
 
 	// Measure bulk insert performance
 	start := time.Now()
-	err = client.bulkInsertStopTimes(ctx, stopTimes)
+	err = client.bulkInsertStopTimes(ctx, stopTimes, nil)
 	duration := time.Since(start)
 
 	require.NoError(t, err, "Bulk insert should succeed")

@@ -6,99 +6,173 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maglev.onebusaway.org/internal/models"
+	"maglev.onebusaway.org/internal/restapi/testdata"
 )
 
 func TestAgenciesWithCoverageHandlerRequiresValidApiKey(t *testing.T) {
-	_, resp, model := serveAndRetrieveEndpoint(t, "/api/where/agencies-with-coverage.json?key=invalid")
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	resp, model := callAPIHandler[CoverageResponse](t, api, "/api/where/agencies-with-coverage.json?key=invalid")
+
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.Equal(t, http.StatusUnauthorized, model.Code)
 	assert.Equal(t, "permission denied", model.Text)
 }
 
 func TestAgenciesWithCoverageHandlerEndToEnd(t *testing.T) {
-	_, resp, model := serveAndRetrieveEndpoint(t, "/api/where/agencies-with-coverage.json?key=TEST")
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	resp, model := callAPIHandler[CoverageResponse](t, api, "/api/where/agencies-with-coverage.json?key=TEST")
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, http.StatusOK, model.Code)
 	assert.Equal(t, "OK", model.Text)
 
-	data, ok := model.Data.(map[string]interface{})
-	require.True(t, ok)
+	assert.Len(t, model.Data.List, 1)
+	agencyCoverage := model.Data.List[0]
+	assert.Equal(t, "25", agencyCoverage.AgencyID)
+	assert.InDelta(t, 40.3304015, agencyCoverage.Lat, 1e-7)
+	assert.InDelta(t, 1.2138890, agencyCoverage.LatSpan, 1e-7)
+	assert.InDelta(t, -122.0981970, agencyCoverage.Lon, 1e-7)
+	assert.InDelta(t, 0.9843940, agencyCoverage.LonSpan, 1e-7)
 
-	list, ok := data["list"].([]interface{})
-	require.True(t, ok)
-	assert.Len(t, list, 1)
-
-	agencyCoverage, ok := list[0].(map[string]interface{})
-	require.True(t, ok)
-	assert.Equal(t, "25", agencyCoverage["agencyId"])
-	assert.InDelta(t, 40.328705, agencyCoverage["lat"], 1e-8)
-	assert.InDelta(t, 1.2188699999999955, agencyCoverage["latSpan"], 1e-8)
-	assert.InDelta(t, -122.101745, agencyCoverage["lon"], 1e-8)
-	assert.InDelta(t, 0.9914899999999989, agencyCoverage["lonSpan"], 1e-8)
-
-	refs, ok := data["references"].(map[string]interface{})
-	require.True(t, ok)
-
-	refAgencies, ok := refs["agencies"].([]interface{})
-	require.True(t, ok)
-	assert.Len(t, refAgencies, 1)
-
-	agencyRef, ok := refAgencies[0].(map[string]interface{})
-	require.True(t, ok)
-	assert.Equal(t, "25", agencyRef["id"])
-	assert.Equal(t, "Redding Area Bus Authority", agencyRef["name"])
-	assert.Equal(t, "http://www.rabaride.com/", agencyRef["url"])
-	assert.Equal(t, "America/Los_Angeles", agencyRef["timezone"])
-	assert.Equal(t, "en", agencyRef["lang"])
-	assert.Equal(t, "530-241-2877", agencyRef["phone"])
-	assert.Equal(t, "", agencyRef["email"])
-	assert.Equal(t, "", agencyRef["fareUrl"])
-	assert.Equal(t, "", agencyRef["disclaimer"])
-	assert.False(t, agencyRef["privateService"].(bool))
-	// Ensure no extra fields
-	assert.Len(t, agencyRef, 10)
-
-	assert.Empty(t, refs["routes"])
-	assert.Empty(t, refs["situations"])
-	assert.Empty(t, refs["stopTimes"])
-	assert.Empty(t, refs["stops"])
-	assert.Empty(t, refs["trips"])
+	assert.ElementsMatch(t, model.Data.References.Agencies, []models.AgencyReference{testdata.Raba})
+	assert.Empty(t, model.Data.References.Routes)
+	assert.Empty(t, model.Data.References.Situations)
+	assert.Empty(t, model.Data.References.StopTimes)
+	assert.Empty(t, model.Data.References.Stops)
+	assert.Empty(t, model.Data.References.Trips)
 }
 
 func TestAgenciesWithCoverageHandlerPagination(t *testing.T) {
 	// Test data (raba.zip) has 1 agency
+	api := createTestApi(t)
+	defer api.Shutdown()
 
-	// Case 1: Default (Offset 0, Limit -1) -> Should return 1
-	_, _, model1 := serveAndRetrieveEndpoint(t, "/api/where/agencies-with-coverage.json?key=TEST")
-	data1, ok := model1.Data.(map[string]interface{})
-	require.True(t, ok, "expected Data to be map[string]interface{}")
-	list1, ok := data1["list"].([]interface{})
-	require.True(t, ok, "expected list to be []interface{}")
-	assert.Len(t, list1, 1)
+	_, model := callAPIHandler[CoverageResponse](t, api, "/api/where/agencies-with-coverage.json?key=TEST&limit=1")
+	assert.Len(t, model.Data.List, 1)
+	assert.False(t, model.Data.LimitExceeded)
 
-	// Case 2: Limit 1 -> Should return 1
-	_, _, model2 := serveAndRetrieveEndpoint(t, "/api/where/agencies-with-coverage.json?key=TEST&limit=1")
-	data2, ok := model2.Data.(map[string]interface{})
-	require.True(t, ok, "expected Data to be map[string]interface{}")
-	list2, ok := data2["list"].([]interface{})
-	require.True(t, ok, "expected list to be []interface{}")
-	assert.Len(t, list2, 1)
+	_, model = callAPIHandler[CoverageResponse](t, api, "/api/where/agencies-with-coverage.json?key=TEST&limit=0")
+	assert.Len(t, model.Data.List, 1)
+	assert.False(t, model.Data.LimitExceeded)
 
-	// Case 3: Limit 0 (should default to -1/all) -> Should return 1
-	// Note: Our new logic treats limit=0 as invalid -> -1 (all)
-	_, _, model3 := serveAndRetrieveEndpoint(t, "/api/where/agencies-with-coverage.json?key=TEST&limit=0")
-	data3, ok := model3.Data.(map[string]interface{})
-	require.True(t, ok, "expected Data to be map[string]interface{}")
-	list3, ok := data3["list"].([]interface{})
-	require.True(t, ok, "expected list to be []interface{}")
-	assert.Len(t, list3, 1)
+	_, model = callAPIHandler[CoverageResponse](t, api, "/api/where/agencies-with-coverage.json?key=TEST&offset=1")
+	assert.Len(t, model.Data.List, 0)
+	assert.False(t, model.Data.LimitExceeded)
+}
 
-	// Case 4: Offset 1 -> Should return 0
-	_, _, model4 := serveAndRetrieveEndpoint(t, "/api/where/agencies-with-coverage.json?key=TEST&offset=1")
-	data4, ok := model4.Data.(map[string]interface{})
-	require.True(t, ok, "expected Data to be map[string]interface{}")
-	list4, ok := data4["list"].([]interface{})
-	require.True(t, ok, "expected list to be []interface{}")
-	assert.Len(t, list4, 0)
+// TestAgenciesWithCoverageHandlerEmptyReferencesNotNull pins the wire format:
+// references.agencies must decode as an empty slice, never nil, so it
+// serializes as `[]` rather than `null`.
+func TestAgenciesWithCoverageHandlerEmptyReferencesNotNull(t *testing.T) {
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	resp, model := callAPIHandler[CoverageResponse](t, api, "/api/where/agencies-with-coverage.json?key=TEST&offset=1")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotNil(t, model.Data.References.Agencies)
+	assert.Empty(t, model.Data.References.Agencies)
+}
+
+func TestAgenciesWithCoverageHandlerLimitExceeded(t *testing.T) {
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	_, err := api.GtfsManager.GtfsDB.DB.Exec("INSERT INTO agencies (id, name, url, timezone) VALUES ('MOCK_SECOND', 'Mock Second Agency', 'http://mock.agency', 'America/Los_Angeles')")
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		if _, err := api.GtfsManager.GtfsDB.DB.Exec("DELETE FROM agencies WHERE id = 'MOCK_SECOND'"); err != nil {
+			t.Errorf("failed to clean up MOCK_SECOND agency: %v", err)
+		}
+	})
+
+	tests := []struct {
+		name              string
+		query             string
+		wantLen           int
+		wantLimitExceeded bool
+	}{
+		{"maxCount below total caps the list", "&maxCount=1", 1, true},
+		{"maxCount equal to total returns all", "&maxCount=2", 2, false},
+		{"maxCount above total returns all", "&maxCount=3", 2, false},
+		{"no maxCount returns all", "", 2, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, model := callAPIHandler[CoverageResponse](t, api,
+				"/api/where/agencies-with-coverage.json?key=TEST"+tt.query)
+			assert.Len(t, model.Data.List, tt.wantLen)
+			assert.Equal(t, tt.wantLimitExceeded, model.Data.LimitExceeded)
+		})
+	}
+}
+
+func TestAgenciesWithCoverageHandlerIncludeReferencesFalse(t *testing.T) {
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	resp, model := callAPIHandler[CoverageResponse](t, api, "/api/where/agencies-with-coverage.json?key=TEST&includeReferences=false")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, model.Code)
+	assert.Equal(t, "OK", model.Text)
+
+	// List should still be present and correct
+	assert.Len(t, model.Data.List, 1)
+
+	// But References.Agencies should be explicitly empty, not containing Raba
+	assert.NotNil(t, model.Data.References.Agencies)
+	assert.Empty(t, model.Data.References.Agencies)
+	assert.Empty(t, model.Data.References.Routes)
+	assert.Empty(t, model.Data.References.Situations)
+	assert.Empty(t, model.Data.References.StopTimes)
+	assert.Empty(t, model.Data.References.Stops)
+	assert.Empty(t, model.Data.References.Trips)
+}
+
+func TestAgenciesWithCoverageHandlerZeroStopTimes(t *testing.T) {
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	// Insert a mock agency with exactly zero stop-times to the test data.
+	_, err := api.GtfsManager.GtfsDB.DB.Exec("INSERT INTO agencies (id, name, url, timezone) VALUES ('MOCK_ZERO', 'Mock Agency', 'http://mock.agency', 'America/Los_Angeles')")
+
+	require.NoError(t, err)
+
+	// Clean up after test
+	t.Cleanup(func() {
+		if _, err := api.GtfsManager.GtfsDB.DB.Exec("DELETE FROM agencies WHERE id = 'MOCK_ZERO'"); err != nil {
+			t.Errorf("failed to clean up MOCK_ZERO agency: %v", err)
+		}
+	})
+
+	resp, model := callAPIHandler[CoverageResponse](t, api, "/api/where/agencies-with-coverage.json?key=TEST")
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, model.Code)
+	assert.Equal(t, "OK", model.Text)
+
+	var mockAgency *models.AgencyCoverage
+	for i, agency := range model.Data.List {
+		if agency.AgencyID == "MOCK_ZERO" {
+			mockAgency = &model.Data.List[i]
+			break
+		}
+	}
+
+	require.NotNil(t, mockAgency, "mock agency should be in the returned list")
+
+	// The spec mandates that latSpan and lonSpan must evaluate exactly to 0
+	// if an agency contains no stop records.
+	assert.Equal(t, 0.0, mockAgency.Lat)
+	assert.Equal(t, 0.0, mockAgency.Lon)
+	assert.Equal(t, 0.0, mockAgency.LatSpan)
+	assert.Equal(t, 0.0, mockAgency.LonSpan)
 }

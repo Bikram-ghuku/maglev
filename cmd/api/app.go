@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,8 +33,8 @@ func gtfsConfigFromData(gtfsCfgData appconf.GtfsConfigData) gtfs.Config {
 		StaticAuthHeaderValue: gtfsCfgData.StaticAuthHeaderValue,
 		GTFSDataPath:          gtfsCfgData.GTFSDataPath,
 		Env:                   gtfsCfgData.Env,
-		Verbose:               gtfsCfgData.Verbose,
-		EnableGTFSTidy:        gtfsCfgData.EnableGTFSTidy,
+
+		EnableGTFSTidy: gtfsCfgData.EnableGTFSTidy,
 	}
 
 	for _, feedData := range gtfsCfgData.RTFeeds {
@@ -64,13 +67,38 @@ func ParseAPIKeys(apiKeysFlag string) []string {
 	return keys
 }
 
+func parseLogLevel(level string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+func newLogHandler(format string, level slog.Level) slog.Handler {
+	opts := &slog.HandlerOptions{Level: level}
+	if strings.EqualFold(format, "json") {
+		return slog.NewJSONHandler(os.Stdout, opts)
+	}
+	return slog.NewTextHandler(os.Stdout, opts)
+}
+
 // BuildApplication creates and initializes the Application with all dependencies.
 // This includes creating the logger, initializing the GTFS manager, and creating the direction calculator.
 // Returns an error if GTFS manager initialization fails.
-func BuildApplication(cfg appconf.Config, gtfsCfg gtfs.Config) (*app.Application, error) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+func BuildApplication(ctx context.Context, cfg appconf.Config, gtfsCfg gtfs.Config) (*app.Application, error) {
+	logger := slog.Default()
+	appMetrics := metrics.NewWithLogger(logger)
+	gtfsCfg.Metrics = appMetrics
 
-	gtfsManager, err := gtfs.InitGTFSManager(gtfsCfg)
+	gtfsManager, err := gtfs.InitGTFSManager(ctx, gtfsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize GTFS manager: %w", err)
 	}
@@ -78,18 +106,13 @@ func BuildApplication(cfg appconf.Config, gtfsCfg gtfs.Config) (*app.Application
 	var directionCalculator *gtfs.AdvancedDirectionCalculator
 	if gtfsManager != nil {
 		directionCalculator = gtfs.NewAdvancedDirectionCalculator(gtfsManager.GtfsDB.Queries)
-
-		err = gtfs.InitializeGlobalCache(context.Background(), gtfsManager.GtfsDB.Queries, directionCalculator)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize global cache: %w", err)
-		}
+		// Register the calculator on the manager so ForceUpdate can evict the
+		// direction cache after every DB update.
+		gtfsManager.DirectionCalculator = directionCalculator
 	}
 
 	// Select clock implementation based on environment
 	appClock := createClock(cfg.Env)
-
-	// Initialize metrics with logger for error reporting
-	appMetrics := metrics.NewWithLogger(logger)
 
 	coreApp := &app.Application{
 		Config:              cfg,
@@ -101,9 +124,14 @@ func BuildApplication(cfg appconf.Config, gtfsCfg gtfs.Config) (*app.Application
 		Metrics:             appMetrics,
 	}
 
-	// Start DB stats collector if database is available
-	if gtfsManager != nil && gtfsManager.GtfsDB != nil && gtfsManager.GtfsDB.DB != nil {
-		appMetrics.StartDBStatsCollector(gtfsManager.GtfsDB.DB, 15*time.Second)
+	// Start DB stats collector using a provider so metrics follow DB hot-swap.
+	if gtfsManager != nil {
+		appMetrics.StartDBStatsCollector(func() *sql.DB {
+			if gtfsManager.GtfsDB == nil {
+				return nil
+			}
+			return gtfsManager.GtfsDB.DB
+		}, 15*time.Second)
 	}
 
 	return coreApp, nil
@@ -124,6 +152,7 @@ func createClock(env appconf.Environment) clock.Clock {
 // CreateServer creates and configures the HTTP server with routes and middleware.
 // Sets up both REST API routes and WebUI routes, applies security headers, and adds request logging.
 func CreateServer(coreApp *app.Application, cfg appconf.Config) (*http.Server, *restapi.RestAPI) {
+
 	api := restapi.NewRestAPI(coreApp)
 
 	webUI := &webui.WebUI{
@@ -140,25 +169,44 @@ func CreateServer(coreApp *app.Application, cfg appconf.Config) (*http.Server, *
 		ErrorLog: slog.NewLogLogger(coreApp.Logger.Handler(), slog.LevelError),
 	}))
 
+	// Apply API-specific middleware closest to the routes. Both middlewares
+	// guard on the "/api/" path prefix internally, so wrapping the whole mux
+	// leaves web UI and other endpoints untouched.
+	// Order (innermost to outermost): expiry -> version.
+	var apiHandler http.Handler = mux
+	apiHandler = restapi.GtfsExpiryMiddleware(api.GtfsManager)(apiHandler)
+	apiHandler = api.VersionValidationMiddleware(apiHandler)
+
+	// Apply compression around apiHandler (the mux plus API-specific middleware)
+	compressedMux := restapi.CompressionMiddleware(apiHandler)
+
+	// Add freshness middleware
+	freshnessHandler := api.FreshnessMiddleware(compressedMux)
+
 	// Wrap with security middleware
-	secureHandler := api.WithSecurityHeaders(mux)
+	secureHandler := api.WithSecurityHeaders(freshnessHandler)
 
 	// Add metrics middleware
 	metricsHandler := restapi.MetricsHandler(coreApp.Metrics)(secureHandler)
 
 	// Add request logging middleware (outermost)
-	requestLogger := logging.NewStructuredLogger(os.Stdout, slog.LevelInfo)
-	requestLogMiddleware := restapi.NewRequestLoggingMiddleware(requestLogger)
+	requestLogMiddleware := restapi.NewRequestLoggingMiddleware(coreApp.Logger)
 
-	handler := restapi.RequestIDMiddleware(requestLogMiddleware(metricsHandler))
+	sizeLimitMiddleware := restapi.SizeLimitMiddleware(1 << 20) // 1 MB limit
+
+	// Panic recovery outermost so all handler panics are caught
+	handler := restapi.NewRecoveryMiddleware(coreApp.Logger, coreApp.Clock)(
+		sizeLimitMiddleware(restapi.RequestIDMiddleware(requestLogMiddleware(metricsHandler))),
+	)
 
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      handler,
-		IdleTimeout:  time.Minute,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		ErrorLog:     slog.NewLogLogger(coreApp.Logger.Handler(), slog.LevelError),
+		Addr:           net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
+		Handler:        handler,
+		IdleTimeout:    time.Minute,
+		ReadTimeout:    5 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MB (explicit; matches Go's default)
+		ErrorLog:       slog.NewLogLogger(coreApp.Logger.Handler(), slog.LevelError),
 	}
 
 	return srv, api
@@ -168,8 +216,11 @@ func CreateServer(coreApp *app.Application, cfg appconf.Config) (*http.Server, *
 // Starts the server in a goroutine, waits for shutdown signals (SIGINT, SIGTERM) or context cancellation,
 // and performs graceful shutdown with a 30-second timeout.
 // Returns an error if the server fails to start or shutdown fails.
-func Run(ctx context.Context, srv *http.Server, coreApp *app.Application, api *restapi.RestAPI, logger *slog.Logger) error {
-	logger.Info("starting server", "addr", srv.Addr)
+func Run(ctx context.Context, srv *http.Server, coreApp *app.Application, api *restapi.RestAPI) error {
+	cfg := coreApp.Config
+	tlsEnabled := cfg.TLSCertPath != "" && cfg.TLSKeyPath != ""
+	logger := coreApp.Logger
+	logger.Info("starting server", "addr", srv.Addr, "tls", tlsEnabled)
 
 	// Set up signal handling for graceful shutdown, merging with provided context
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -180,7 +231,13 @@ func Run(ctx context.Context, srv *http.Server, coreApp *app.Application, api *r
 
 	// Start server in a goroutine
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if tlsEnabled {
+			err = srv.ListenAndServeTLS(cfg.TLSCertPath, cfg.TLSKeyPath)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			serverErrors <- err
 		}
 	}()
@@ -249,24 +306,24 @@ func dumpConfigJSON(cfg appconf.Config, gtfsCfg gtfs.Config) {
 	}
 
 	// Build JSON config structure
-	jsonConfig := map[string]interface{}{
+	jsonConfig := map[string]any{
 		"port":             cfg.Port,
 		"env":              envStr,
-		"api-keys":         cfg.ApiKeys,
-		"exempt-api-keys":  cfg.ExemptApiKeys,
+		"api-keys":         fmt.Sprintf("***REDACTED*** (%d keys)", len(cfg.ApiKeys)),
+		"exempt-api-keys":  fmt.Sprintf("***REDACTED*** (%d keys)", len(cfg.ExemptApiKeys)),
 		"rate-limit":       cfg.RateLimit,
 		"gtfs-static-feed": staticFeed,
 		"data-path":        gtfsCfg.GTFSDataPath,
 	}
 
-	var feeds []map[string]interface{}
+	var feeds []map[string]any
 	for _, feedCfg := range gtfsCfg.RTFeeds {
 		redactedHeaders := make(map[string]string)
 		for k := range feedCfg.Headers {
 			redactedHeaders[k] = "***REDACTED***"
 		}
 
-		feed := map[string]interface{}{
+		feed := map[string]any{
 			"id":                    feedCfg.ID,
 			"trip-updates-url":      feedCfg.TripUpdatesURL,
 			"vehicle-positions-url": feedCfg.VehiclePositionsURL,
@@ -287,7 +344,8 @@ func dumpConfigJSON(cfg appconf.Config, gtfsCfg gtfs.Config) {
 	// Marshal to JSON with indentation
 	output, err := json.MarshalIndent(jsonConfig, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error marshaling config to JSON: %v\n", err)
+		logger := slog.Default().With(slog.String("component", "app"))
+		logging.LogError(logger, "Error marshaling config to JSON", err)
 		os.Exit(1)
 	}
 

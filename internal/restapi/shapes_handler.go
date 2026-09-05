@@ -3,20 +3,18 @@ package restapi
 import (
 	"net/http"
 
-	"github.com/twpayne/go-polyline"
 	"maglev.onebusaway.org/internal/models"
 	"maglev.onebusaway.org/internal/utils"
 )
 
+// shapesHandler returns the encoded polyline shape for a route's geographic path.
 func (api *RestAPI) shapesHandler(w http.ResponseWriter, r *http.Request) {
-	parsed, _ := utils.GetParsedIDFromContext(r.Context())
-	agencyID := parsed.AgencyID
-	shapeID := parsed.CodeID
+	agencyID, shapeCode, ok := api.extractAndValidateAgencyCodeID(w, r)
+	if !ok {
+		return
+	}
 
 	ctx := r.Context()
-
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
 
 	_, err := api.GtfsManager.GtfsDB.Queries.GetAgency(ctx, agencyID)
 
@@ -25,7 +23,7 @@ func (api *RestAPI) shapesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	shapes, err := api.GtfsManager.GtfsDB.Queries.GetShapeByID(ctx, shapeID)
+	shapes, err := api.GtfsManager.GtfsDB.Queries.GetShapeByID(ctx, shapeCode)
 	if err != nil {
 		api.serverErrorResponse(w, r, err)
 		return
@@ -36,18 +34,16 @@ func (api *RestAPI) shapesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Include every point with no simplification or consecutive-duplicate
+	// filtering, matching the Java reference (ShapeBeanServiceImpl.getPolylineForShapeId).
 	lineCoords := make([][]float64, 0, len(shapes))
-
-	for i, point := range shapes {
-		// Filter consecutive duplicate points to avoid zero-length segments
-		if i > 0 && point.Lat == shapes[i-1].Lat && point.Lon == shapes[i-1].Lon {
-			continue
-		}
+	for _, point := range shapes {
 		lineCoords = append(lineCoords, []float64{point.Lat, point.Lon})
 	}
 
-	// Encode as a single continuous polyline to ensure valid delta offsets
-	encodedPoints := string(polyline.EncodeCoords(lineCoords))
+	// Encode using a floor-based encoder to stay byte-for-byte identical to the
+	// Java PolylineEncoder (which floors coordinates rather than rounding).
+	encodedPoints := utils.EncodePolyline(lineCoords)
 
 	shapeEntry := models.ShapeEntry{
 		Length: len(lineCoords),
@@ -55,5 +51,5 @@ func (api *RestAPI) shapesHandler(w http.ResponseWriter, r *http.Request) {
 		Points: encodedPoints,
 	}
 
-	api.sendResponse(w, r, models.NewEntryResponse(shapeEntry, models.NewEmptyReferences(), api.Clock))
+	api.sendResponse(w, r, models.NewEntryResponse(shapeEntry, *models.NewEmptyReferences(), api.Clock))
 }

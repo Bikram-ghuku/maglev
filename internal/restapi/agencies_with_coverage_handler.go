@@ -7,15 +7,13 @@ import (
 	"maglev.onebusaway.org/internal/utils"
 )
 
+// agenciesWithCoverageHandler returns all transit agencies along with their geographic coverage areas.
 func (api *RestAPI) agenciesWithCoverageHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
 	// Check if context is already cancelled
 	if ctx.Err() != nil {
-		api.serverErrorResponse(w, r, ctx.Err())
+		api.clientCanceledResponse(w, r, ctx.Err())
 		return
 	}
 
@@ -29,43 +27,25 @@ func (api *RestAPI) agenciesWithCoverageHandler(w http.ResponseWriter, r *http.R
 	offset, limit := utils.ParsePaginationParams(r)
 	agencies, limitExceeded := utils.PaginateSlice(agencies, offset, limit)
 
-	lat, lon, latSpan, lonSpan := api.GtfsManager.GetRegionBounds()
+	boundsMap := api.GtfsManager.GetRegionBounds()
+	// Important to use an empty slice rather than nil so that empty json responses don't return nil.
 	agenciesWithCoverage := make([]models.AgencyCoverage, 0)
-	agencyReferences := make([]models.AgencyReference, 0)
-
 	for _, a := range agencies {
+		bounds := boundsMap[a.ID]
 		agenciesWithCoverage = append(
 			agenciesWithCoverage,
-			models.NewAgencyCoverage(a.ID, lat, latSpan, lon, lonSpan),
-		)
-
-		agencyReferences = append(
-			agencyReferences,
-			models.NewAgencyReference(
-				a.ID,
-				a.Name,
-				a.Url,
-				a.Timezone,
-				a.Lang.String,
-				a.Phone.String,
-				a.Email.String,
-				a.FareUrl.String,
-				"",
-				false,
-			),
+			models.NewAgencyCoverage(a.ID, bounds.Lat, bounds.LatSpan, bounds.Lon, bounds.LonSpan),
 		)
 	}
 
-	// Create references with the agency
-	references := models.ReferencesModel{
-		Agencies:   agencyReferences,
-		Routes:     []interface{}{},
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
-		Stops:      []models.Stop{},
-		Trips:      []interface{}{},
+	references := models.NewEmptyReferences()
+
+	includeReferences := ShouldIncludeReferences(r)
+
+	if includeReferences {
+		references.Agencies = buildAgencyReferences(agencies)
 	}
 
-	response := models.NewListResponse(agenciesWithCoverage, references, limitExceeded, api.Clock)
+	response := models.NewListResponse(agenciesWithCoverage, *references, limitExceeded, api.Clock)
 	api.sendResponse(w, r, response)
 }

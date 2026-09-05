@@ -2,18 +2,18 @@ package restapi
 
 import (
 	"net/http"
+	"strconv"
 
 	"maglev.onebusaway.org/internal/models"
 	"maglev.onebusaway.org/internal/utils"
 )
 
+// tripHandler returns details for a single trip, including its route, stop times, and shape.
 func (api *RestAPI) tripHandler(w http.ResponseWriter, r *http.Request) {
-	parsed, _ := utils.GetParsedIDFromContext(r.Context())
-	agencyID := parsed.AgencyID
-	id := parsed.CodeID // The raw GTFS trip ID
-
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
+	agencyID, id, ok := api.extractAndValidateAgencyCodeID(w, r)
+	if !ok {
+		return
+	}
 
 	ctx := r.Context()
 
@@ -49,15 +49,20 @@ func (api *RestAPI) tripHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tripModel := &models.Trip{
-		ID:             utils.FormCombinedID(agencyID, trip.ID),
-		RouteID:        utils.FormCombinedID(agencyID, trip.RouteID),
-		ServiceID:      utils.FormCombinedID(agencyID, trip.ServiceID),
-		DirectionID:    trip.DirectionID.Int64,
-		BlockID:        blockID,
-		ShapeID:        shapeID,
-		TripHeadsign:   trip.TripHeadsign.String,
-		TripShortName:  trip.TripShortName.String,
-		RouteShortName: route.ShortName.String,
+		ID:            utils.FormCombinedID(agencyID, trip.ID),
+		RouteID:       utils.FormCombinedID(agencyID, trip.RouteID),
+		ServiceID:     utils.FormCombinedID(agencyID, trip.ServiceID),
+		DirectionID:   strconv.FormatInt(trip.DirectionID.Int64, 10),
+		BlockID:       blockID,
+		ShapeID:       shapeID,
+		TripHeadsign:  trip.TripHeadsign.String,
+		TripShortName: trip.TripShortName.String,
+		// RouteShortName is the trip's own per-trip route short name (the GTFS
+		// trips.txt route_short_name extension), not the route's short name.
+		// Maglev does not store that column, so it is always empty — matching the
+		// Java reference (BeanFactoryV2.getTrip reads trip.getRouteShortName()).
+		// Clients fall back to the route's shortName in the references block.
+		RouteShortName: "",
 	}
 	tripResponse := models.NewTripResponse(
 		tripModel,
@@ -67,29 +72,22 @@ func (api *RestAPI) tripHandler(w http.ResponseWriter, r *http.Request) {
 
 	references := models.NewEmptyReferences()
 
-	references.Routes = append(references.Routes, models.NewRoute(
-		utils.FormCombinedID(agencyID, trip.RouteID),
-		route.AgencyID,
-		route.ShortName.String,
-		route.LongName.String,
-		route.Desc.String,
-		models.RouteType(route.Type),
-		route.Url.String,
-		route.Color.String,
-		route.TextColor.String))
+	// includeReferences defaults to true; when explicitly false the references
+	// block is returned with all sub-arrays empty (matches the Java reference).
+	if ShouldIncludeReferences(r) {
+		references.Routes = append(references.Routes, models.NewRoute(
+			utils.FormCombinedID(route.AgencyID, trip.RouteID),
+			route.AgencyID,
+			route.ShortName.String,
+			route.LongName.String,
+			route.Desc.String,
+			models.RouteType(route.Type),
+			route.Url.String,
+			route.Color.String,
+			route.TextColor.String))
 
-	references.Agencies = append(references.Agencies, models.NewAgencyReference(
-		agency.ID,
-		agency.Name,
-		agency.Url,
-		agency.Timezone,
-		agency.Lang.String,
-		agency.Phone.String,
-		agency.Email.String,
-		agency.FareUrl.String,
-		"",
-		false,
-	))
+		references.Agencies = append(references.Agencies, models.AgencyReferenceFromDatabase(&agency))
+	}
 
-	api.sendResponse(w, r, models.NewEntryResponse(tripResponse, references, api.Clock))
+	api.sendResponse(w, r, models.NewEntryResponse(tripResponse, *references, api.Clock))
 }

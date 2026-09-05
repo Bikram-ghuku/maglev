@@ -1,13 +1,5 @@
 package models
 
-type BlockResponse struct {
-	Data BlockData `json:"data"`
-}
-
-type BlockData struct {
-	Entry BlockEntry `json:"entry"`
-}
-
 type BlockEntry struct {
 	Configurations []BlockConfiguration `json:"configurations"`
 	ID             string               `json:"id"`
@@ -20,15 +12,21 @@ type BlockConfiguration struct {
 }
 
 type TripBlock struct {
-	AccumulatedSlackTime int             `json:"accumulatedSlackTime"`
+	AccumulatedSlackTime ModelDuration   `json:"accumulatedSlackTime"`
 	BlockStopTimes       []BlockStopTime `json:"blockStopTimes"`
 	DistanceAlongBlock   float64         `json:"distanceAlongBlock"`
 	TripId               string          `json:"tripId"`
 }
 
 type BlockStopTime struct {
-	AccumulatedSlackTime float64  `json:"accumulatedSlackTime"`
-	BlockSequence        int      `json:"blockSequence"`
-	DistanceAlongBlock   float64  `json:"distanceAlongBlock"`
-	StopTime             StopTime `json:"stopTime"`
+	AccumulatedSlackTime ModelDuration     `json:"accumulatedSlackTime"`
+	BlockSequence        int               `json:"blockSequence"`
+	DistanceAlongBlock   float64           `json:"distanceAlongBlock"`
+	StopTime             BlockStopTimeData `json:"stopTime"`
+}
+
+type BlockStopTimeData struct {
+	StopTime
+	DropOffType int `json:"dropOffType"`
+	PickupType  int `json:"pickupType"`
 }

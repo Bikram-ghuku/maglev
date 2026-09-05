@@ -37,13 +37,6 @@ func NewDirectionPrecomputer(queries *gtfsdb.Queries, db *sql.DB) *DirectionPrec
 	}
 }
 
-// SetStandardDeviationThreshold sets the standard deviation threshold for the calculator.
-// IMPORTANT: This method is NOT thread-safe and must be called before
-// PrecomputeAllDirections, never concurrently with it.
-func (dp *DirectionPrecomputer) SetStandardDeviationThreshold(threshold float64) {
-	dp.calculator.SetStandardDeviationThreshold(threshold)
-}
-
 // PrecomputeAllDirections computes and stores directions for all stops using parallel processing
 func (dp *DirectionPrecomputer) PrecomputeAllDirections(ctx context.Context) error {
 	startTime := time.Now()
@@ -85,7 +78,9 @@ func (dp *DirectionPrecomputer) PrecomputeAllDirections(ctx context.Context) err
 			slog.Int("total_points", totalPoints),
 			slog.Float64("estimated_memory_mb", estimatedMemoryMB))
 		// Set the cache on the calculator for use during precomputation
-		dp.calculator.SetShapeCache(shapeCache)
+		if err := dp.calculator.SetShapeCache(shapeCache); err != nil {
+			return fmt.Errorf("failed to set shape cache: %w", err)
+		}
 	}
 
 	// ===== PHASE 1: PARALLEL DIRECTION CALCULATION (read-only) =====
@@ -276,16 +271,4 @@ func (dp *DirectionPrecomputer) loadShapeCache(ctx context.Context) (map[string]
 	}
 
 	return shapeCache, nil
-}
-
-// PrecomputeDirectionsAsync runs direction precomputation in a background goroutine
-func (dp *DirectionPrecomputer) PrecomputeDirectionsAsync(ctx context.Context) {
-	go func() {
-		if err := dp.PrecomputeAllDirections(ctx); err != nil {
-			if ctx.Err() == nil {
-				// Only log error if not caused by context cancellation
-				logging.LogError(dp.logger, "Background direction precomputation failed", err)
-			}
-		}
-	}()
 }

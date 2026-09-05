@@ -1,6 +1,7 @@
 package gtfs
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -19,16 +20,16 @@ func TestManagerShutdown(t *testing.T) {
 		GtfsURL:      testDataPath,
 		GTFSDataPath: ":memory:",
 		Env:          appconf.Test,
-		Verbose:      false,
 	}
 
 	// Initialize manager
-	manager, err := InitGTFSManager(config)
+	manager, err := InitGTFSManager(context.Background(), config)
 	require.NoError(t, err, "Failed to initialize GTFS manager")
 	require.NotNil(t, manager, "Manager should not be nil")
 
 	// Verify manager is functional
-	agencies := manager.GetAgencies()
+	agencies, err := manager.GtfsDB.Queries.ListAgencies(context.Background())
+	require.NoError(t, err)
 	assert.Greater(t, len(agencies), 0, "Should have loaded agencies")
 
 	// Test shutdown
@@ -64,12 +65,11 @@ func TestManagerShutdownWithRealtime(t *testing.T) {
 				Enabled:             true,
 			},
 		},
-		Env:     appconf.Test,
-		Verbose: false,
+		Env: appconf.Test,
 	}
 
 	// Initialize manager
-	manager, err := InitGTFSManager(config)
+	manager, err := InitGTFSManager(context.Background(), config)
 	require.NoError(t, err, "Failed to initialize GTFS manager")
 	require.NotNil(t, manager, "Manager should not be nil")
 
@@ -101,11 +101,10 @@ func TestManagerShutdownIdempotent(t *testing.T) {
 		GtfsURL:      testDataPath,
 		GTFSDataPath: ":memory:",
 		Env:          appconf.Test,
-		Verbose:      false,
 	}
 
 	// Initialize manager
-	manager, err := InitGTFSManager(config)
+	manager, err := InitGTFSManager(context.Background(), config)
 	require.NoError(t, err, "Failed to initialize GTFS manager")
 
 	// Call shutdown multiple times - should not panic or hang

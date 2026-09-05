@@ -15,6 +15,12 @@ type CoordinateBounds struct {
 	MaxLon float64
 }
 
+// BoundsContain reports whether (lat, lon) falls within bounds, inclusive.
+func BoundsContain(bounds CoordinateBounds, lat, lon float64) bool {
+	return lat >= bounds.MinLat && lat <= bounds.MaxLat &&
+		lon >= bounds.MinLon && lon <= bounds.MaxLon
+}
+
 // Distance calculates the distance between two points on the Earth.
 // For short distances (under ~22km), it uses a highly optimized Equirectangular
 // approximation to save CPU cycles. For longer distances, it falls back to the exact formula.
@@ -53,7 +59,17 @@ func CalculateBounds(lat, lon, distance float64) CoordinateBounds {
 	lonRadians := lon * math.Pi / 180
 
 	latRadius := RadiusOfEarthInMeters
-	lonRadius := math.Cos(latRadians) * RadiusOfEarthInMeters
+
+	// Use math.Abs to prevent a negative cosine (possible for out-of-range latitudes)
+	// which would invert the longitude bounds
+	cosLat := math.Abs(math.Cos(latRadians))
+
+	// Prevent division by zero (Infinity) exactly at the poles
+	if cosLat < 1e-10 {
+		cosLat = 1e-10
+	}
+
+	lonRadius := cosLat * RadiusOfEarthInMeters
 
 	latOffset := distance / latRadius
 	lonOffset := distance / lonRadius

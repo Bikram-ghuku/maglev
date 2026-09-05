@@ -1,7 +1,8 @@
 package restapi
 
 import (
-	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/OneBusAway/go-gtfs"
 	"maglev.onebusaway.org/gtfsdb"
 	"maglev.onebusaway.org/internal/models"
+	"maglev.onebusaway.org/internal/nulls"
 	"maglev.onebusaway.org/internal/utils"
 )
 
@@ -24,7 +26,7 @@ type ArrivalAndDepartureParams struct {
 
 // parseArrivalAndDepartureParams parses and validates request parameters.
 // Returns parameters and a map of validation errors if any.
-func (api *RestAPI) parseArrivalAndDepartureParams(r *http.Request) (ArrivalAndDepartureParams, map[string][]string) {
+func parseArrivalAndDepartureParams(r *http.Request, loc ...*time.Location) (ArrivalAndDepartureParams, map[string][]string) {
 	params := ArrivalAndDepartureParams{
 		MinutesAfter:  30, // Default 30 minutes after
 		MinutesBefore: 5,  // Default 5 minutes before
@@ -33,10 +35,22 @@ func (api *RestAPI) parseArrivalAndDepartureParams(r *http.Request) (ArrivalAndD
 	// Initialize errors map
 	fieldErrors := make(map[string][]string)
 
+	// Cap at one service day. Java has no cap; we keep one to bound
+	// per-request work — the handler iterates only ±1 day of stop_times,
+	// so anything larger returns the same data anyway.
+	const maxMinutesAfter = 24 * 60
+	const maxMinutesBefore = 24 * 60
+
 	// Validate minutesAfter
 	if minutesAfterStr := r.URL.Query().Get("minutesAfter"); minutesAfterStr != "" {
 		if minutesAfter, err := strconv.Atoi(minutesAfterStr); err == nil {
-			params.MinutesAfter = minutesAfter
+			if minutesAfter < 0 {
+				fieldErrors["minutesAfter"] = []string{"must be a non-negative integer"}
+			} else if minutesAfter > maxMinutesAfter {
+				params.MinutesAfter = maxMinutesAfter
+			} else {
+				params.MinutesAfter = minutesAfter
+			}
 		} else {
 			fieldErrors["minutesAfter"] = []string{"must be a valid integer"}
 		}
@@ -45,7 +59,13 @@ func (api *RestAPI) parseArrivalAndDepartureParams(r *http.Request) (ArrivalAndD
 	// Validate minutesBefore
 	if minutesBeforeStr := r.URL.Query().Get("minutesBefore"); minutesBeforeStr != "" {
 		if minutesBefore, err := strconv.Atoi(minutesBeforeStr); err == nil {
-			params.MinutesBefore = minutesBefore
+			if minutesBefore < 0 {
+				fieldErrors["minutesBefore"] = []string{"must be a non-negative integer"}
+			} else if minutesBefore > maxMinutesBefore {
+				params.MinutesBefore = maxMinutesBefore
+			} else {
+				params.MinutesBefore = minutesBefore
+			}
 		} else {
 			fieldErrors["minutesBefore"] = []string{"must be a valid integer"}
 		}
@@ -95,22 +115,40 @@ func (api *RestAPI) parseArrivalAndDepartureParams(r *http.Request) (ArrivalAndD
 		return params, fieldErrors
 	}
 
+	// If a timezone location was provided, localize serviceDate and time so that
+	// callers receive times in the agency's timezone by default. This prevents the
+	// bug where time.Unix(ms/1000, 0) creates a UTC time and downstream
+	// Year()/Month()/Day()/Format() calls extract the wrong calendar date for
+	// agencies in positive UTC offsets.
+	if len(loc) > 0 && loc[0] != nil {
+		if params.ServiceDate != nil {
+			localized := params.ServiceDate.In(loc[0])
+			params.ServiceDate = &localized
+		}
+		if params.Time != nil {
+			localized := params.Time.In(loc[0])
+			params.Time = &localized
+		}
+	}
+
 	return params, nil
 }
 
+// arrivalAndDepartureForStopHandler returns arrival and departure information for a stop.
+// It handles both the single arrival-and-departure and the list arrivals-and-departures endpoints,
+// merging scheduled stop times with real-time predictions when available.
 func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *http.Request) {
-	parsed, _ := utils.GetParsedIDFromContext(r.Context())
-	stopAgencyID := parsed.AgencyID
-	stopCode := parsed.CodeID
-	stopID := parsed.CombinedID
+	stopAgencyID, stopCode, ok := api.extractAndValidateAgencyCodeID(w, r)
+	if !ok {
+		return
+	}
+	stopID := utils.FormCombinedID(stopAgencyID, stopCode)
 
 	ctx := r.Context()
 
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
-	// Capture parsing errors
-	params, fieldErrors := api.parseArrivalAndDepartureParams(r)
+	// Capture parsing errors (syntax validation only — localization happens below
+	// once we know the agency timezone).
+	params, fieldErrors := parseArrivalAndDepartureParams(r)
 	if len(fieldErrors) > 0 {
 		api.validationErrorResponse(w, r, fieldErrors)
 		return
@@ -143,19 +181,47 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 
 	stop, err := api.GtfsManager.GtfsDB.Queries.GetStop(ctx, stopCode)
 	if err != nil {
-		api.sendNotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			api.sendNotFound(w, r)
+		} else {
+			api.serverErrorResponse(w, r, err)
+		}
 		return
 	}
 
 	stopAgency, err := api.GtfsManager.GtfsDB.Queries.GetAgency(ctx, stopAgencyID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			api.sendNotFound(w, r)
+		} else {
+			api.serverErrorResponse(w, r, err)
+		}
+		return
+	}
+
+	// Localize serviceDate and time to the agency's timezone now that we know it.
+	// This ensures Year()/Month()/Day()/Format() extract the correct local date.
+	loc, err := loadAgencyLocation(stopAgency.ID, stopAgency.Timezone)
+	if err != nil {
 		api.serverErrorResponse(w, r, err)
 		return
+	}
+	if params.ServiceDate != nil {
+		localized := params.ServiceDate.In(loc)
+		params.ServiceDate = &localized
+	}
+	if params.Time != nil {
+		localized := params.Time.In(loc)
+		params.Time = &localized
 	}
 
 	trip, err := api.GtfsManager.GtfsDB.Queries.GetTrip(ctx, tripID)
 	if err != nil {
-		api.sendNotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			api.sendNotFound(w, r)
+		} else {
+			api.serverErrorResponse(w, r, err)
+		}
 		return
 	}
 
@@ -165,58 +231,60 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	stopTimes, err := api.GtfsManager.GtfsDB.Queries.GetStopTimesForTrip(ctx, tripID)
-	if err != nil {
-		api.serverErrorResponse(w, r, err)
-		return
+	var targetRow gtfsdb.GetTargetStopTimeWithTotalStopsRow
+
+	if params.StopSequence != nil {
+		seqRow, seqErr := api.GtfsManager.GtfsDB.Queries.GetTargetStopTimeWithTotalStopsBySequence(ctx, gtfsdb.GetTargetStopTimeWithTotalStopsBySequenceParams{
+			TripID:       tripID,
+			StopID:       stopCode,
+			StopSequence: int64(*params.StopSequence),
+		})
+		if seqErr != nil {
+			if errors.Is(seqErr, sql.ErrNoRows) {
+				api.sendNotFound(w, r)
+			} else {
+				api.serverErrorResponse(w, r, seqErr)
+			}
+			return
+		}
+
+		targetRow = gtfsdb.GetTargetStopTimeWithTotalStopsRow(seqRow)
+	} else {
+		targetRow, err = api.GtfsManager.GtfsDB.Queries.GetTargetStopTimeWithTotalStops(ctx, gtfsdb.GetTargetStopTimeWithTotalStopsParams{
+			TripID: tripID,
+			StopID: stopCode,
+		})
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				api.sendNotFound(w, r)
+			} else {
+				api.serverErrorResponse(w, r, err)
+			}
+			return
+		}
 	}
 
-	var targetStopTime *struct {
+	targetStopTime := struct {
 		ArrivalTime   int64
 		DepartureTime int64
 		StopSequence  int64
 		StopHeadsign  string
-	}
-
-	for _, st := range stopTimes {
-		if st.StopID == stopCode {
-			if params.StopSequence != nil && int64(*params.StopSequence) != st.StopSequence {
-				continue
-			}
-			targetStopTime = &struct {
-				ArrivalTime   int64
-				DepartureTime int64
-				StopSequence  int64
-				StopHeadsign  string
-			}{
-				ArrivalTime:   st.ArrivalTime,
-				DepartureTime: st.DepartureTime,
-				StopSequence:  st.StopSequence,
-				StopHeadsign:  st.StopHeadsign.String,
-			}
-			break
-		}
-	}
-
-	if targetStopTime == nil {
-		api.sendNotFound(w, r)
-		return
+	}{
+		ArrivalTime:   targetRow.ArrivalTime,
+		DepartureTime: targetRow.DepartureTime,
+		StopSequence:  targetRow.StopSequence,
 	}
 
 	// Set current time
 	var currentTime time.Time
-	loc := utils.LoadLocationWithUTCFallBack(stopAgency.Timezone, stopAgency.ID)
 	if params.Time != nil {
-		currentTime = params.Time.In(loc)
+		currentTime = *params.Time
 	} else {
 		currentTime = api.Clock.Now().In(loc)
 	}
 
-	// Use the provided service date
+	// serviceDate is already localized above; extract midnight in agency's TZ.
 	serviceDate := *params.ServiceDate
-	serviceDateMillis := serviceDate.Unix() * 1000
-
-	// Service date is a "date" only, so get midnight in agency's TZ
 	serviceMidnight := time.Date(
 		serviceDate.Year(),
 		serviceDate.Month(),
@@ -234,18 +302,21 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 	scheduledArrivalTime := serviceMidnight.Add(arrivalOffset)
 	scheduledDepartureTime := serviceMidnight.Add(departureOffset)
 
-	// Convert to ms since epoch
-	scheduledArrivalTimeMs := scheduledArrivalTime.UnixMilli()
-	scheduledDepartureTimeMs := scheduledDepartureTime.UnixMilli()
-
-	// Get real-time data for this trip if available
+	// Get real-time data for this trip if available.
+	//
+	// numberOfStopsAway is initialized to 0, matching the plural handler and
+	// the spec's "no block location available → distanceFromStop,
+	// numberOfStopsAway, vehicleId, predicted, lastUpdateTime, and tripStatus
+	// are absent or zero" (arrivals-and-departures-for-stop §11a). A real
+	// negative value (vehicle already past this stop) comes back from
+	// snapshot.metricsForStop and overrides the zero init — the sentinel
+	// -1 collided with that legitimate signal.
 	var (
-		predictedArrivalTime, predictedDepartureTime int64
-		predicted                                    bool
-		vehicleID                                    string
-		tripStatus                                   *models.TripStatusForTripDetails
-		distanceFromStop                             float64
-		numberOfStopsAway                            int
+		predicted         bool
+		vehicleID         string
+		tripStatus        *models.TripStatus
+		distanceFromStop  float64
+		numberOfStopsAway int
 	)
 
 	// If vehicleId is provided, validate it matches the trip
@@ -269,20 +340,49 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 	}
 
 	if vehicle != nil && vehicle.Trip != nil {
-		vehicleID = vehicle.ID.ID
+		if vehicle.ID != nil {
+			// Combined {agencyId}_{vehicleId} form per spec; matches
+			// tripStatus.vehicleId (set by BuildTripStatus below) and lets
+			// clients round-trip this value into /trip-for-vehicle/{id} and
+			// /trip-details/{id}?vehicleId=... which both extract the agency
+			// prefix before doing GetVehicleByID on the raw id.
+			vehicleID = utils.FormCombinedID(route.AgencyID, vehicle.ID.ID)
+		} else {
+			api.Logger.Warn("vehicle with nil ID descriptor found for trip", "tripID", tripID)
+		}
 		predicted = true
 	}
 
-	status, _ := api.BuildTripStatus(ctx, route.AgencyID, tripID, serviceDate, currentTime)
+	// Fetch the trip's frequency rows once and share them with BuildTripStatus.
+	freqRows, freqErr := api.GtfsManager.GtfsDB.Queries.GetFrequenciesForTrip(ctx, tripID)
+	if freqErr != nil {
+		api.serverErrorResponse(w, r, freqErr)
+		return
+	}
+	freqMap := map[string][]gtfsdb.Frequency{tripID: freqRows}
+
+	// Use serviceMidnight (not the raw user-supplied serviceDate, which may
+	// carry a wall-clock time portion) for all schedule math — matches Java's
+	// BlockInstance contract ("midnight time relative to stop times"; see
+	// BlockInstance.java:69-72) and the plural handler's convention.
+	status, statusExtras, statusErr := api.BuildTripStatus(ctx, route.AgencyID, tripID, nil, serviceMidnight, currentTime, freqMap)
+	if statusErr != nil {
+		api.Logger.Warn("BuildTripStatus failed",
+			"tripID", tripID, "error", statusErr)
+	}
+
+	var predictedArrivalTime, predictedDepartureTime time.Time
 	if status != nil {
 		tripStatus = status
 
-		predictedArrivalTime = scheduledArrivalTimeMs
-		predictedDepartureTime = scheduledDepartureTimeMs
+		predictedArrivalTime = scheduledArrivalTime
+		predictedDepartureTime = scheduledDepartureTime
 
-		predictedArrival, predictedDeparture := api.getPredictedTimes(tripID, stopCode, targetStopTime.StopSequence, scheduledArrivalTime, scheduledDepartureTime)
+		// getPredictedTimes now returns 3 values (arr, dep, isPredicted)
+		// and includes trip-level Delay fallback for consistency with the plural handler
+		predictedArrival, predictedDeparture, isPredicted := api.getPredictedTimes(tripID, stopCode, targetStopTime.StopSequence, scheduledArrivalTime, scheduledDepartureTime)
 
-		if predictedArrival != 0 && predictedDeparture != 0 {
+		if isPredicted {
 			predictedArrivalTime = predictedArrival
 			predictedDepartureTime = predictedDeparture
 			predicted = true
@@ -290,25 +390,23 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 			predicted = false
 		}
 
-		if vehicle != nil && vehicle.Position != nil {
-			distanceFromStop = api.getBlockDistanceToStop(ctx, tripID, stopCode, vehicle, serviceDate)
-
-			numberOfStopsAwayPtr := api.getNumberOfStopsAway(ctx, tripID, int(targetStopTime.StopSequence), vehicle, serviceDate)
-			if numberOfStopsAwayPtr != nil {
-				numberOfStopsAway = *numberOfStopsAwayPtr
-			} else {
-				numberOfStopsAway = -1
+		// Reuse the snapshot BuildTripStatus already computed for this trip.
+		// It applies the same schedule-deviation shift internally, so
+		// recomputing here just to run metricsForStop was duplicating work.
+		if statusExtras.snapshot != nil {
+			if d, n, ok := statusExtras.snapshot.metricsForStop(tripID, int(targetStopTime.StopSequence)); ok {
+				distanceFromStop = d
+				numberOfStopsAway = n
 			}
 		}
 	}
 
-	totalStopsInTrip := len(stopTimes)
+	totalStopsInTrip := int(targetRow.TotalStops)
 
-	blockTripSequence := api.calculateBlockTripSequence(ctx, tripID, serviceDate)
+	blockTripSequence := api.calculateBlockTripSequence(ctx, tripID, serviceMidnight)
 
 	lastUpdateTime := api.GtfsManager.GetVehicleLastUpdateTime(vehicle)
-
-	situationIDs := api.GetSituationIDsForTrip(r.Context(), tripID)
+	situationIDs, situationRefs := api.situationsFromRefs(statusExtras.situations)
 
 	arrival := models.NewArrivalAndDeparture(
 		utils.FormCombinedID(route.AgencyID, route.ID), // routeID
@@ -318,9 +416,9 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 		trip.TripHeadsign.String,                       // tripHeadsign
 		stopID,                                         // stopID
 		vehicleID,                                      // vehicleID
-		serviceDateMillis,                              // serviceDate
-		scheduledArrivalTimeMs,                         // scheduledArrivalTime
-		scheduledDepartureTimeMs,                       // scheduledDepartureTime
+		serviceMidnight,                                // serviceDate
+		scheduledArrivalTime,                           // scheduledArrivalTime
+		scheduledDepartureTime,                         // scheduledDepartureTime
 		predictedArrivalTime,                           // predictedArrivalTime
 		predictedDepartureTime,                         // predictedDepartureTime
 		lastUpdateTime,                                 // lastUpdateTime
@@ -340,38 +438,22 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 		situationIDs,                                   // situationIds
 	)
 
+	// The arrival's frequency uses the window-matched row fetched above.
+	if len(freqRows) > 0 {
+		converted := models.NewFrequencyFromDB(*selectFrequency(freqRows, serviceMidnight, currentTime), serviceMidnight)
+		arrival.Frequency = &converted
+	}
+
 	references := models.NewEmptyReferences()
 
 	// Add Stop Agency Reference
-	references.Agencies = append(references.Agencies, models.NewAgencyReference(
-		stopAgency.ID,
-		stopAgency.Name,
-		stopAgency.Url,
-		stopAgency.Timezone,
-		stopAgency.Lang.String,
-		stopAgency.Phone.String,
-		stopAgency.Email.String,
-		stopAgency.FareUrl.String,
-		"",
-		false,
-	))
+	references.Agencies = append(references.Agencies, models.AgencyReferenceFromDatabase(&stopAgency))
 
 	// Add Route Agency Reference if different from Stop Agency
 	if route.AgencyID != stopAgency.ID {
 		routeAgency, err := api.GtfsManager.GtfsDB.Queries.GetAgency(ctx, route.AgencyID)
 		if err == nil {
-			references.Agencies = append(references.Agencies, models.NewAgencyReference(
-				routeAgency.ID,
-				routeAgency.Name,
-				routeAgency.Url,
-				routeAgency.Timezone,
-				routeAgency.Lang.String,
-				routeAgency.Phone.String,
-				routeAgency.Email.String,
-				routeAgency.FareUrl.String,
-				"",
-				false,
-			))
+			references.Agencies = append(references.Agencies, models.AgencyReferenceFromDatabase(&routeAgency))
 		} else {
 			api.Logger.Warn("failed to fetch route agency for reference", "agencyID", route.AgencyID, "error", err)
 		}
@@ -383,11 +465,11 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 		utils.FormCombinedID(route.AgencyID, trip.ServiceID),
 		trip.TripHeadsign.String,
 		"", // trip short name
-		trip.DirectionID.Int64,
+		strconv.FormatInt(trip.DirectionID.Int64, 10),
 		utils.FormCombinedID(route.AgencyID, trip.BlockID.String),
 		utils.FormCombinedID(route.AgencyID, trip.ShapeID.String),
 	)
-	references.Trips = append(references.Trips, tripRef)
+	references.Trips = append(references.Trips, *tripRef)
 
 	// Include active trip if it's different from the parameter trip and trip status is not null
 	if tripStatus != nil && tripStatus.ActiveTripID != "" {
@@ -405,11 +487,11 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 						utils.FormCombinedID(activeRoute.AgencyID, activeTrip.ServiceID),
 						activeTrip.TripHeadsign.String,
 						"", // trip short name
-						activeTrip.DirectionID.Int64,
+						strconv.FormatInt(activeTrip.DirectionID.Int64, 10),
 						utils.FormCombinedID(activeRoute.AgencyID, activeTrip.BlockID.String),
 						utils.FormCombinedID(activeRoute.AgencyID, activeTrip.ShapeID.String),
 					)
-					references.Trips = append(references.Trips, activeTripRef)
+					references.Trips = append(references.Trips, *activeTripRef)
 				}
 			}
 		}
@@ -443,18 +525,41 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 			stopIDSet[closestStopID] = true
 		}
 	}
-	for stopID := range stopIDSet {
-		stopData, err := api.GtfsManager.GtfsDB.Queries.GetStop(ctx, stopID)
-		if err != nil {
+	// batch fetch
+	stopIDsSlice := make([]string, 0, len(stopIDSet))
+	for sid := range stopIDSet {
+		stopIDsSlice = append(stopIDsSlice, sid)
+	}
+
+	batchedStops, err := api.GtfsManager.GtfsDB.Queries.GetStopsByIDs(ctx, stopIDsSlice)
+	if err != nil {
+		api.Logger.Warn("failed to batch fetch stops for references", "error", err)
+		batchedStops = nil
+	}
+
+	stopDataMap := make(map[string]gtfsdb.Stop)
+	for _, s := range batchedStops {
+		stopDataMap[s.ID] = s
+	}
+
+	batchedRoutesForStops, err := api.GtfsManager.GtfsDB.Queries.GetRoutesForStops(ctx, stopIDsSlice)
+	if err != nil {
+		api.Logger.Warn("failed to batch fetch routes for stops", "error", err)
+		batchedRoutesForStops = nil
+	}
+
+	routesByStopID := make(map[string][]gtfsdb.GetRoutesForStopsRow)
+	for _, routeRow := range batchedRoutesForStops {
+		routesByStopID[routeRow.StopID] = append(routesByStopID[routeRow.StopID], routeRow)
+	}
+
+	for _, sid := range stopIDsSlice {
+		stopData, exists := stopDataMap[sid]
+		if !exists {
 			continue
 		}
 
-		routesForThisStop, err := api.GtfsManager.GtfsDB.Queries.GetRoutesForStops(ctx, []string{stopID})
-		if err != nil {
-			api.Logger.Warn("failed to fetch routes for stop", "stopID", stopID, "error", err)
-			continue
-		}
-
+		routesForThisStop := routesByStopID[sid]
 		combinedRouteIDs := make([]string, len(routesForThisStop))
 		for i, route := range routesForThisStop {
 			combinedRouteIDs[i] = utils.FormCombinedID(route.AgencyID, route.ID)
@@ -480,7 +585,7 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 			Code:               stopData.Code.String,
 			Direction:          api.DirectionCalculator.CalculateStopDirection(r.Context(), stopData.ID, stopData.Direction),
 			LocationType:       int(stopData.LocationType.Int64),
-			WheelchairBoarding: utils.MapWheelchairBoarding(utils.NullWheelchairBoardingOrUnknown(stopData.WheelchairBoarding)),
+			WheelchairBoarding: utils.MapWheelchairBoarding(nulls.WheelchairBoardingOrUnknown(stopData.WheelchairBoarding)),
 			RouteIDs:           combinedRouteIDs,
 			StaticRouteIDs:     combinedRouteIDs,
 		}
@@ -488,9 +593,11 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 	}
 
 	// Build routes references
+	routeRefs := make(map[string]models.Route, len(routeIDSet))
 	for _, route := range routeIDSet {
-		routeRef := models.NewRoute(
-			utils.FormCombinedID(route.AgencyID, route.ID),
+		combinedID := utils.FormCombinedID(route.AgencyID, route.ID)
+		routeRefs[combinedID] = models.NewRoute(
+			combinedID,
 			route.AgencyID,
 			route.ShortName.String,
 			route.LongName.String,
@@ -499,38 +606,36 @@ func (api *RestAPI) arrivalAndDepartureForStopHandler(w http.ResponseWriter, r *
 			route.Url.String,
 			route.Color.String,
 			route.TextColor.String)
-
-		references.Routes = append(references.Routes, routeRef)
 	}
+	references.Routes = utils.MapValues(routeRefs)
 
-	if len(situationIDs) > 0 {
-		alerts := api.GtfsManager.GetAlertsForTrip(r.Context(), tripID)
-		if len(alerts) > 0 {
-			situations := api.BuildSituationReferences(alerts, route.AgencyID)
-			for _, situation := range situations {
-				references.Situations = append(references.Situations, situation)
-			}
-		}
-	}
+	references.Situations = append(references.Situations, situationRefs...)
 
-	response := models.NewEntryResponse(arrival, references, api.Clock)
+	response := models.NewEntryResponse(arrival, *references, api.Clock)
 	api.sendResponse(w, r, response)
 }
 
+// getPredictedTimes computes predicted arrival/departure times from GTFS-RT TripUpdate data.
+// It implements a 3-tier fallback strategy matching the plural handler's behavior:
+//  1. Exact stop match — uses per-stop arrival/departure time or delay directly
+//  2. Propagated delay — uses delay from the closest prior stop in the trip
+//  3. Trip-level delay — falls back to TripUpdate.Delay when no per-stop data exists
+//
+// Returns (predictedArrivalMs, predictedDepartureMs, isPredicted).
+// Returns (time.Time{}, time.Time{}, false) if no prediction can be made.
 func (api *RestAPI) getPredictedTimes(
 	tripID string,
 	stopCode string,
 	targetStopSequence int64,
 	scheduledArrivalTime, scheduledDepartureTime time.Time,
-) (predictedArrivalTime, predictedDepartureTime int64) {
-
+) (predictedArrivalTime, predictedDepartureTime time.Time, predicted bool) {
 	realTimeTrip, _ := api.GtfsManager.GetTripUpdateByID(tripID)
-	if realTimeTrip == nil || len(realTimeTrip.StopTimeUpdates) == 0 {
-		return 0, 0
+	if realTimeTrip == nil || (len(realTimeTrip.StopTimeUpdates) == 0) && realTimeTrip.Delay == nil {
+		return time.Time{}, time.Time{}, false
 	}
 
-	var arrivalOffset, departureOffset *int64
-	var propagatedDelay int64 = 0
+	var arrivalOffset, departureOffset *time.Duration
+	var propagatedDelay time.Duration
 	var closestPriorSequence int64 = -1
 	var foundTarget bool
 
@@ -544,19 +649,19 @@ func (api *RestAPI) getPredictedTimes(
 			foundTarget = true
 			if stu.Arrival != nil {
 				if stu.Arrival.Time != nil {
-					offset := stu.Arrival.Time.Sub(scheduledArrivalTime).Nanoseconds()
+					offset := stu.Arrival.Time.Sub(scheduledArrivalTime)
 					arrivalOffset = &offset
 				} else if stu.Arrival.Delay != nil {
-					offset := int64(*stu.Arrival.Delay)
+					offset := *stu.Arrival.Delay
 					arrivalOffset = &offset
 				}
 			}
 			if stu.Departure != nil {
 				if stu.Departure.Time != nil {
-					offset := stu.Departure.Time.Sub(scheduledDepartureTime).Nanoseconds()
+					offset := stu.Departure.Time.Sub(scheduledDepartureTime)
 					departureOffset = &offset
 				} else if stu.Departure.Delay != nil {
-					offset := int64(*stu.Departure.Delay)
+					offset := *stu.Departure.Delay
 					departureOffset = &offset
 				}
 			}
@@ -565,59 +670,80 @@ func (api *RestAPI) getPredictedTimes(
 
 		if seq != -1 && seq < targetStopSequence && seq > closestPriorSequence {
 			closestPriorSequence = seq
+			propagatedDelay = 0
 			if stu.Departure != nil && stu.Departure.Delay != nil {
-				propagatedDelay = int64(*stu.Departure.Delay)
+				propagatedDelay = *stu.Departure.Delay
 			} else if stu.Arrival != nil && stu.Arrival.Delay != nil {
-				propagatedDelay = int64(*stu.Arrival.Delay)
+				propagatedDelay = *stu.Arrival.Delay
 			}
 		}
 	}
 
-	if !foundTarget && closestPriorSequence == -1 {
-		return 0, 0
+	// CHANGED: Restructured fallback chain to include trip-level Delay (Tier 3)
+	// Previously this returned (0, 0) when !foundTarget && closestPriorSequence == -1,
+	// ignoring trip-level delay entirely
+	if !foundTarget {
+		if closestPriorSequence != -1 {
+			// Fallback 1: Propagated delay from closest prior stop
+			arr := propagatedDelay
+			dep := propagatedDelay
+			arrivalOffset = &arr
+			departureOffset = &dep
+		} else if realTimeTrip.Delay != nil {
+			// Fallback 2: Trip-level delay — matches plural handler behavior
+			delay := *realTimeTrip.Delay
+			arrivalOffset = &delay
+			departureOffset = &delay
+		} else {
+			return time.Time{}, time.Time{}, false
+		}
 	}
 
-	if arrivalOffset == nil {
+	// Mirror Java's propagateScheduleDeviationForwardAcrossStop
+	// (ArrivalAndDepartureServiceImpl.java:925-930). When slack between arrival
+	// and departure is zero (the typical case at most stops), the
+	// propagation reduces to "copy the present side." Falling back to
+	// propagatedDelay here would mix the target stop with an unrelated
+	// earlier stop's deviation, producing a negative dwell on stops where
+	// arr != dep. Only fall back to propagatedDelay if BOTH sides are nil.
+	if arrivalOffset == nil && departureOffset != nil {
+		arrivalOffset = departureOffset
+	} else if arrivalOffset == nil {
 		arrivalOffset = &propagatedDelay
 	}
-	if departureOffset == nil {
+	if departureOffset == nil && arrivalOffset != nil {
+		departureOffset = arrivalOffset
+	} else if departureOffset == nil {
 		departureOffset = &propagatedDelay
 	}
+
+	// Java's ±1h blockNotActive filter (GtfsRealtimeSource.java:711-752)
+	// lives at RT ingestion — it stops the VehicleLocationRecord from
+	// becoming a BlockLocation. Once a BlockLocation exists, Java's
+	// setPredictedTimesFromScheduleDeviation (ArrivalAndDepartureService
+	// Impl.java:772-805) applies the deviation unconditionally, no cap.
+	// Applying the guard HERE silently drops predictions for genuinely
+	// severely-late buses (which is exactly when riders most need to see
+	// the delay), so we skip the cap on this path and let the offset flow
+	// through. Block-level scheduleDeviation may still be gated upstream
+	// by GetScheduleDeviationForBlock — that's the appropriate location.
 
 	// Rule 1: arrival == departure (Simplified Logic)
 	if scheduledArrivalTime.Equal(scheduledDepartureTime) {
 		offset := *arrivalOffset
 
-		if *departureOffset != propagatedDelay {
+		if *departureOffset != propagatedDelay && *departureOffset != *arrivalOffset {
 			offset = *departureOffset
 		}
 
-		predictedArrival := scheduledArrivalTime.Add(time.Duration(offset))
-		predictedDeparture := scheduledDepartureTime.Add(time.Duration(offset))
-		return predictedArrival.UnixMilli(), predictedDeparture.UnixMilli()
+		predictedArrival := scheduledArrivalTime.Add(offset)
+		predictedDeparture := scheduledDepartureTime.Add(offset)
+		return predictedArrival, predictedDeparture, true
 	}
 
 	// Rule 2: arrival < departure
-	predictedArrival := scheduledArrivalTime.Add(time.Duration(*arrivalOffset))
-	predictedDeparture := scheduledDepartureTime.Add(time.Duration(*departureOffset))
+	predictedArrival := scheduledArrivalTime.Add(*arrivalOffset)
+	predictedDeparture := scheduledDepartureTime.Add(*departureOffset)
 
-	return predictedArrival.UnixMilli(), predictedDeparture.UnixMilli()
-}
-
-func (api *RestAPI) getNumberOfStopsAway(ctx context.Context, targetTripID string, targetStopSequence int, vehicle *gtfs.Vehicle, serviceDate time.Time) *int {
-	currentVehicleStopSequence := getCurrentVehicleStopSequence(vehicle)
-	if currentVehicleStopSequence == nil {
-		return nil
-	}
-
-	activeTripID := GetVehicleActiveTripID(vehicle)
-	if activeTripID == "" {
-		activeTripID = targetTripID
-	}
-
-	targetGlobalSeq := api.getBlockSequenceForStopSequence(ctx, targetTripID, targetStopSequence, serviceDate)
-	vehicleGlobalSeq := api.getBlockSequenceForStopSequence(ctx, activeTripID, *currentVehicleStopSequence, serviceDate)
-
-	numberOfStopsAway := targetGlobalSeq - vehicleGlobalSeq - 1
-	return &numberOfStopsAway
+	return predictedArrival, predictedDeparture, true
 }

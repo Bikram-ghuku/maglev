@@ -1,13 +1,17 @@
 package gtfs
 
 import (
+	"strings"
+	"time"
+
 	"maglev.onebusaway.org/internal/appconf"
+	"maglev.onebusaway.org/internal/metrics"
 )
 
 // Configuration for a single GTFS-RT feed.
 type RTFeedConfig struct {
 	ID                  string
-	AgencyIDs           []string // Reserved for future use - currently not used for filtering realtime data
+	AgencyIDs           []string // When set, only realtime data for these agencies is included
 	TripUpdatesURL      string
 	VehiclePositionsURL string
 	ServiceAlertsURL    string
@@ -24,8 +28,9 @@ type Config struct {
 	RTFeeds               []RTFeedConfig
 	GTFSDataPath          string
 	Env                   appconf.Environment
-	Verbose               bool
 	EnableGTFSTidy        bool
+	StartupRetries        []time.Duration
+	Metrics               *metrics.Metrics
 }
 
 // enabledFeeds returns only the enabled feeds that have at least one URL configured.
@@ -37,4 +42,8 @@ func (config Config) enabledFeeds() []RTFeedConfig {
 		}
 	}
 	return feeds
+}
+
+func (config Config) isLocalFile() bool {
+	return !strings.HasPrefix(config.GtfsURL, "http://") && !strings.HasPrefix(config.GtfsURL, "https://")
 }

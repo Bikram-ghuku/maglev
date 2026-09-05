@@ -4,52 +4,58 @@ import (
 	"net/http"
 
 	"maglev.onebusaway.org/internal/models"
+	"maglev.onebusaway.org/internal/nulls"
 	"maglev.onebusaway.org/internal/utils"
 )
 
+// routesForAgencyHandler returns all routes operated by a given agency.
 func (api *RestAPI) routesForAgencyHandler(w http.ResponseWriter, r *http.Request) {
-	id, _ := utils.GetIDFromContext(r.Context())
-
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
-	agency := api.GtfsManager.FindAgency(id)
-
-	if agency == nil {
-		api.sendNull(w, r)
+	id, ok := api.extractAndValidateID(w, r)
+	if !ok {
 		return
 	}
 
-	routesForAgency := api.GtfsManager.RoutesForAgencyID(id)
+	ctx := r.Context()
+	agency, err := api.GtfsManager.FindAgency(ctx, id)
+	if err != nil {
+		api.serverErrorResponse(w, r, err)
+		return
+	}
+	if agency == nil {
+		api.sendNotFound(w, r)
+		return
+	}
 
-	// Apply pagination
-	offset, limit := utils.ParsePaginationParams(r)
-	routesForAgency, limitExceeded := utils.PaginateSlice(routesForAgency, offset, limit)
-	// Safe allocation logic
+	routesForAgency, err := api.GtfsManager.RoutesForAgencyID(ctx, id)
+	if err != nil {
+		api.serverErrorResponse(w, r, err)
+		return
+	}
+
 	routesList := make([]models.Route, 0, len(routesForAgency))
 
 	for _, route := range routesForAgency {
 		routesList = append(routesList, models.NewRoute(
-			utils.FormCombinedID(route.Agency.Id, route.Id), route.Agency.Id, route.ShortName, route.LongName,
-			route.Description, models.RouteType(route.Type),
-			route.Url, route.Color, route.TextColor))
+			utils.FormCombinedID(agency.ID, route.ID),
+			agency.ID,
+			nulls.StringOrEmpty(route.ShortName),
+			nulls.StringOrEmpty(route.LongName),
+			nulls.StringOrEmpty(route.Desc),
+			models.RouteType(route.Type),
+			nulls.StringOrEmpty(route.Url),
+			nulls.StringOrEmpty(route.Color),
+			nulls.StringOrEmpty(route.TextColor)))
 	}
 
-	references := models.ReferencesModel{
-		Agencies: []models.AgencyReference{
-			models.NewAgencyReference(
-				agency.Id, agency.Name, agency.Url, agency.Timezone,
-				agency.Language, agency.Phone, agency.Email,
-				agency.FareUrl, "", false,
-			),
-		},
-		Routes:     []interface{}{},
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
-		Stops:      []models.Stop{},
-		Trips:      []interface{}{},
+	references := models.NewEmptyReferences()
+	// When includeReferences=false the references block is present but empty.
+	if ShouldIncludeReferences(r) {
+		references.Agencies = []models.AgencyReference{
+			models.AgencyReferenceFromDatabase(agency),
+		}
 	}
 
-	response := models.NewListResponse(routesList, references, limitExceeded, api.Clock)
+	// Spec: this endpoint returns all matching routes, so limitExceeded is always false.
+	response := models.NewListResponse(routesList, *references, false, api.Clock)
 	api.sendResponse(w, r, response)
 }

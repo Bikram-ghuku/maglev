@@ -3,31 +3,39 @@ package gtfs
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/sync/singleflight"
 	"maglev.onebusaway.org/gtfsdb"
 	"maglev.onebusaway.org/internal/utils"
 )
 
 const (
 	defaultStandardDeviationThreshold = 0.7
-	shapePointWindow                  = 5
 )
 
 // AdvancedDirectionCalculator implements the OneBusAway Java algorithm for stop direction calculation
 type AdvancedDirectionCalculator struct {
 	queries                    *gtfsdb.Queries
 	standardDeviationThreshold float64
-	contextCache               map[string][]gtfsdb.GetStopsWithShapeContextRow   // Cache of stop shape context data
 	shapeCache                 map[string][]gtfsdb.GetShapePointsWithDistanceRow // Cache of all shape data for bulk operations
 	initialized                atomic.Bool                                       // Tracks whether concurrent operations have started
-	cacheMutex                 sync.RWMutex                                      // Protects map access
+	cacheMutex                 sync.RWMutex                                      // Protects shapeCache map access
+	// directionResults caches computed stop directions.
+	// Only non-error results are cached; transient DB errors are never stored so that
+	// a recovered database will be retried on the next request.
+	// Lifecycle note: This map caches computed directions to reduce database load.
+	// It is explicitly cleared during GTFS reloads (via UpdateQueries) to prevent
+	// stale directions from persisting across dataset updates.
+	directionResults sync.Map           // Cached direction results (stopID -> string), includes negative cache
+	requestGroup     singleflight.Group // Prevents duplicate concurrent computations for the same stop
 }
 
 // NewAdvancedDirectionCalculator creates a new advanced direction calculator
@@ -38,42 +46,26 @@ func NewAdvancedDirectionCalculator(queries *gtfsdb.Queries) *AdvancedDirectionC
 	}
 }
 
-// SetStandardDeviationThreshold sets the standard deviation threshold for direction variance checking.
-// IMPORTANT: This must be called before any concurrent operations begin.
-// Panics if called after CalculateStopDirection has been invoked.
-func (adc *AdvancedDirectionCalculator) SetStandardDeviationThreshold(threshold float64) {
-	if adc.initialized.Load() {
-		panic("SetStandardDeviationThreshold called after concurrent operations have started")
-	}
-	adc.standardDeviationThreshold = threshold
+// ClearCache clears the direction result cache so stale entries from old GTFS
+// data are not served.
+func (adc *AdvancedDirectionCalculator) ClearCache() {
+	adc.directionResults.Clear()
 }
 
-// SetShapeCache sets a pre-loaded cache of shape data to avoid database queries during bulk operations.
-// This significantly improves performance when calculating directions for many stops.
+// SetShapeCache is retained exclusively for use by the DirectionPrecomputer during startup.
+// It sets a pre-loaded cache of shape data to avoid thousands of database queries during
+// the precomputation phase, significantly improving startup performance.
 // IMPORTANT: This must be called before any concurrent operations begin.
-// Panics if called after CalculateStopDirection has been invoked.
-func (adc *AdvancedDirectionCalculator) SetShapeCache(cache map[string][]gtfsdb.GetShapePointsWithDistanceRow) {
+// Returns an error if called after CalculateStopDirection has been invoked.
+func (adc *AdvancedDirectionCalculator) SetShapeCache(cache map[string][]gtfsdb.GetShapePointsWithDistanceRow) error {
 	adc.cacheMutex.Lock()
 	defer adc.cacheMutex.Unlock()
 
 	if adc.initialized.Load() {
-		panic("SetShapeCache called after concurrent operations have started")
+		return errors.New("SetShapeCache called after concurrent operations have started")
 	}
 	adc.shapeCache = cache
-}
-
-// SetContextCache injects the bulk-loaded context data.
-// IMPORTANT: This must be called before any concurrent calculation operations begin.
-// Panics if called after internal state has been initialized (i.e., after the first
-// fallback to shape-based calculation).
-func (adc *AdvancedDirectionCalculator) SetContextCache(cache map[string][]gtfsdb.GetStopsWithShapeContextRow) {
-	adc.cacheMutex.Lock()
-	defer adc.cacheMutex.Unlock()
-
-	if adc.initialized.Load() {
-		panic("SetContextCache called after concurrent operations have started")
-	}
-	adc.contextCache = cache
+	return nil
 }
 
 // CalculateStopDirection computes the direction for a stop using the Java algorithm
@@ -84,33 +76,61 @@ func (adc *AdvancedDirectionCalculator) CalculateStopDirection(ctx context.Conte
 		}
 	}
 
+	// Check the in-memory result cache (includes negative cache for empty results)
+	if cached, ok := adc.directionResults.Load(stopID); ok {
+		return cached.(string)
+	}
+
 	// Mark as initialized for concurrency safety
 	adc.initialized.Store(true)
 
-	return adc.computeFromShapes(ctx, stopID)
+	// Fall back to computing from shapes, protected by singleflight
+	// This ensures concurrent requests for the SAME stopID don't hit the DB multiple times.
+	v, _, _ := adc.requestGroup.Do(stopID, func() (any, error) {
+		// Double-check cache inside the singleflight in case another goroutine just finished it
+		if cached, ok := adc.directionResults.Load(stopID); ok {
+			return cached.(string), nil
+		}
+
+		// Actually compute it (Hits the DB)
+		computedDir, err := adc.computeFromShapes(context.WithoutCancel(ctx), stopID)
+
+		// Only cache when there was no transient error. A transient error (e.g. DB
+		// connection lost) must not permanently poison the cache; omitting it here
+		// means the next request will retry the DB.
+		if err == nil {
+			adc.directionResults.Store(stopID, computedDir)
+		}
+
+		// Intentionally return nil so singleflight shares the empty fallback result with concurrent callers.
+		// Since we skip caching on error, future requests will safely retry the DB.
+		return computedDir, nil
+	})
+
+	return v.(string)
 }
 
 // translateGtfsDirection converts GTFS direction field to compass direction
 func (adc *AdvancedDirectionCalculator) translateGtfsDirection(direction string) string {
 	direction = strings.TrimSpace(strings.ToLower(direction))
 
-	// Try text-based directions
+	// Try text-based directions and compass abbreviations
 	switch direction {
-	case "north":
+	case "north", "n":
 		return "N"
-	case "northeast":
+	case "northeast", "ne":
 		return "NE"
-	case "east":
+	case "east", "e":
 		return "E"
-	case "southeast":
+	case "southeast", "se":
 		return "SE"
-	case "south":
+	case "south", "s":
 		return "S"
-	case "southwest":
+	case "southwest", "sw":
 		return "SW"
-	case "west":
+	case "west", "w":
 		return "W"
-	case "northwest":
+	case "northwest", "nw":
 		return "NW"
 	}
 
@@ -135,28 +155,17 @@ func (adc *AdvancedDirectionCalculator) translateGtfsDirection(direction string)
 	return ""
 }
 
-// computeFromShapes calculates direction from shape data using the Java algorithm
-func (adc *AdvancedDirectionCalculator) computeFromShapes(ctx context.Context, stopID string) string {
-
-	var stopTrips []gtfsdb.GetStopsWithShapeContextRow
-
-	adc.cacheMutex.RLock()
-	hasCache := adc.contextCache != nil
-	if hasCache {
-		stopTrips = adc.contextCache[stopID]
-	}
-	adc.cacheMutex.RUnlock()
-
-	// Use cache if available, otherwise hit DB
-	if !hasCache {
-		var err error
-		stopTrips, err = adc.queries.GetStopsWithShapeContext(ctx, stopID)
-		if err != nil {
-			slog.Warn("failed to get stop shape context",
-				slog.String("stopID", stopID),
-				slog.String("error", err.Error()))
-			return ""
-		}
+// computeFromShapes calculates direction from shape data using the Java algorithm.
+// Returns (direction, nil) on success, ("", nil) when there is legitimately no shape
+// data for the stop (safe to cache), or ("", err) on a transient database error
+// (must NOT be cached so the next request retries the DB).
+func (adc *AdvancedDirectionCalculator) computeFromShapes(ctx context.Context, stopID string) (string, error) {
+	stopTrips, err := adc.queries.GetStopsWithShapeContext(ctx, stopID)
+	if err != nil {
+		slog.Warn("failed to get stop shape context",
+			slog.String("stopID", stopID),
+			slog.String("error", err.Error()))
+		return "", err
 	}
 
 	// Collect orientations from all trips, using cache to avoid duplicates
@@ -174,6 +183,8 @@ func (adc *AdvancedDirectionCalculator) computeFromShapes(ctx context.Context, s
 		stopLat = stopTrips[0].Lat
 		stopLon = stopTrips[0].Lon
 	}
+
+	var lastTransientErr error
 
 	for _, stopTrip := range stopTrips {
 		if !stopTrip.ShapeID.Valid {
@@ -201,6 +212,13 @@ func (adc *AdvancedDirectionCalculator) computeFromShapes(ctx context.Context, s
 		// Calculate orientation at this stop location using shape point window
 		orientation, err := adc.calculateOrientationAtStop(ctx, shapeID, distTraveled, stopLat, stopLon)
 		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				slog.Warn("failed to calculate orientation at stop",
+					slog.String("stopID", stopID),
+					slog.String("shapeID", shapeID),
+					slog.String("error", err.Error()))
+				lastTransientErr = err
+			}
 			continue
 		}
 
@@ -210,12 +228,15 @@ func (adc *AdvancedDirectionCalculator) computeFromShapes(ctx context.Context, s
 	}
 
 	if len(orientations) == 0 {
-		return ""
+		if lastTransientErr != nil {
+			return "", lastTransientErr
+		}
+		return "", nil
 	}
 
 	// Single orientation - return it directly
 	if len(orientations) == 1 {
-		return adc.getAngleAsDirection(orientations[0])
+		return adc.getAngleAsDirection(orientations[0]), nil
 	}
 
 	// Calculate mean orientation vector
@@ -231,7 +252,7 @@ func (adc *AdvancedDirectionCalculator) computeFromShapes(ctx context.Context, s
 	// Intentional improvement over Java's exact == 0.0 comparison;
 	// floating-point mean of cos/sin values is unlikely to be exactly zero.
 	if math.Abs(xMu) < 1e-6 && math.Abs(yMu) < 1e-6 {
-		return ""
+		return "", nil
 	}
 
 	// Calculate standard deviation and compare against threshold
@@ -241,7 +262,7 @@ func (adc *AdvancedDirectionCalculator) computeFromShapes(ctx context.Context, s
 	xStdDev := math.Sqrt(xVariance)
 	yStdDev := math.Sqrt(yVariance)
 	if xStdDev > adc.standardDeviationThreshold || yStdDev > adc.standardDeviationThreshold {
-		return "" // Too much variance
+		return "", nil // Too much variance
 	}
 
 	// Calculate median orientation
@@ -262,10 +283,10 @@ func (adc *AdvancedDirectionCalculator) computeFromShapes(ctx context.Context, s
 		normalizedThetas = append(normalizedThetas, thetaMu+delta)
 	}
 
-	sort.Float64s(normalizedThetas)
+	slices.Sort(normalizedThetas)
 	thetaMedian := median(normalizedThetas)
 
-	return adc.getAngleAsDirection(thetaMedian)
+	return adc.getAngleAsDirection(thetaMedian), nil
 }
 
 // calculateOrientationAtStop calculates the orientation at a stop using a window of shape points
@@ -290,8 +311,13 @@ func (adc *AdvancedDirectionCalculator) calculateOrientationAtStop(ctx context.C
 	} else {
 		// Fall back to database query if no cache
 		shapePoints, err = adc.queries.GetShapePointsWithDistance(ctx, shapeID)
-		if err != nil || len(shapePoints) < 2 {
+		if err != nil {
 			return 0, err
+		}
+		if len(shapePoints) < 2 {
+			// Insufficient points is a data condition, not a transient error.
+			// Return ErrNoRows so the caller treats this the same as "no shape data".
+			return 0, sql.ErrNoRows
 		}
 	}
 
@@ -328,29 +354,65 @@ func (adc *AdvancedDirectionCalculator) calculateOrientationAtStop(ctx context.C
 		closestIdx = 0
 	}
 
-	// Define window around stop
-	indexFrom := closestIdx - shapePointWindow
-	if indexFrom < 0 {
-		indexFrom = 0
+	// Match the Java reference: the orientation is the bearing of the single shape
+	// segment the stop lies on. Java's DistanceTraveledShapePointIndex computes
+	// computeOrientation(index-1, index) over the segment bracketing the stop — NOT
+	// a wide multi-point chord. A wide chord rotates the bearing on curves and
+	// produces adjacent-bucket (±45°) divergences from the reference.
+	n := len(shapePoints)
+	var fromIdx, toIdx int
+	switch {
+	case closestIdx <= 0:
+		fromIdx, toIdx = 0, 1
+	case closestIdx >= n-1:
+		fromIdx, toIdx = n-2, n-1
+	default:
+		// Pick whichever adjacent segment (prev→closest or closest→next) the stop
+		// lies nearest to — i.e. the segment the stop is actually on.
+		prevD := distanceToSegment(stopLat, stopLon,
+			shapePoints[closestIdx-1].Lat, shapePoints[closestIdx-1].Lon,
+			shapePoints[closestIdx].Lat, shapePoints[closestIdx].Lon)
+		nextD := distanceToSegment(stopLat, stopLon,
+			shapePoints[closestIdx].Lat, shapePoints[closestIdx].Lon,
+			shapePoints[closestIdx+1].Lat, shapePoints[closestIdx+1].Lon)
+		if prevD <= nextD {
+			fromIdx, toIdx = closestIdx-1, closestIdx
+		} else {
+			fromIdx, toIdx = closestIdx, closestIdx+1
+		}
 	}
-	indexTo := closestIdx + shapePointWindow
-	if indexTo >= len(shapePoints) {
-		indexTo = len(shapePoints) - 1
+
+	fromPoint := shapePoints[fromIdx]
+	toPoint := shapePoints[toIdx]
+
+	// Use raw lon/lat deltas with NO cos(latitude) scaling, matching the Java
+	// reference (SphericalGeometryLibrary.getOrientation). A cos-lat correction
+	// would be more geographically accurate but diverges from the reference values
+	// clients expect, so we intentionally omit it.
+	dx := toPoint.Lon - fromPoint.Lon
+	dy := toPoint.Lat - fromPoint.Lat
+
+	return math.Atan2(dy, dx), nil
+}
+
+// distanceToSegment returns the (planar) distance from point (plat, plon) to the
+// segment (alat, alon)–(blat, blon). Used only to decide which adjacent shape
+// segment a stop lies on, so a flat lat/lon approximation is sufficient.
+func distanceToSegment(plat, plon, alat, alon, blat, blon float64) float64 {
+	dx := blon - alon
+	dy := blat - alat
+	if dx == 0 && dy == 0 {
+		return math.Hypot(plon-alon, plat-alat)
 	}
-
-	// Calculate orientation from the window using flat-earth approximation
-	if indexTo > indexFrom {
-		fromPoint := shapePoints[indexFrom]
-		toPoint := shapePoints[indexTo]
-
-		dx := (toPoint.Lon - fromPoint.Lon) * math.Cos(fromPoint.Lat*math.Pi/180.0)
-		dy := toPoint.Lat - fromPoint.Lat
-
-		orientation := math.Atan2(dy, dx)
-		return orientation, nil
+	t := ((plon-alon)*dx + (plat-alat)*dy) / (dx*dx + dy*dy)
+	if t < 0 {
+		t = 0
+	} else if t > 1 {
+		t = 1
 	}
-
-	return 0, sql.ErrNoRows
+	projLon := alon + t*dx
+	projLat := alat + t*dy
+	return math.Hypot(plon-projLon, plat-projLat)
 }
 
 // getAngleAsDirection converts a radian angle to compass direction

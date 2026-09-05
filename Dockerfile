@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 # Install build dependencies for CGO (required by mattn/go-sqlite3)
 RUN apk add --no-cache gcc musl-dev
@@ -8,7 +8,8 @@ WORKDIR /build
 
 # Copy dependency files first for better layer caching
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 # Copy source code
 COPY . .
@@ -27,7 +28,11 @@ ARG BUILD_HOST=docker
 ARG GIT_COMMIT_TIME=unknown
 
 ARG TARGETARCH
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -tags sqlite_fts5 \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} \
+    go build \
+    -tags "sqlite_fts5 sqlite_math-functions" \
     -ldflags "-X 'maglev.onebusaway.org/internal/buildinfo.CommitHash=${GIT_COMMIT}' \
               -X 'maglev.onebusaway.org/internal/buildinfo.Branch=${GIT_BRANCH}' \
               -X 'maglev.onebusaway.org/internal/buildinfo.BuildTime=${BUILD_TIME}' \
@@ -42,7 +47,7 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -tags sqlite_fts5 \
     -o maglev ./cmd/api
 
 # Runtime stage
-FROM alpine:3.21
+FROM alpine:3.24
 
 LABEL org.opencontainers.image.source="https://github.com/OneBusAway/maglev"
 LABEL org.opencontainers.image.description="REST API server for OneBusAway transit data"

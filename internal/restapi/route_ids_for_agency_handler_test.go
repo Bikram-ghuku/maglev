@@ -1,16 +1,23 @@
 package restapi
 
 import (
+	"context"
+	"database/sql"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maglev.onebusaway.org/gtfsdb"
+	"maglev.onebusaway.org/internal/restapi/testdata"
 )
 
 func TestRouteIdsForAgencyRequiresValidApiKey(t *testing.T) {
-	_, resp, model := serveAndRetrieveEndpoint(t, "/api/where/route-ids-for-agency/test.json?key=invalid")
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	resp, model := callAPIHandler[RouteIDsForAgencyResponse](t, api, "/api/where/route-ids-for-agency/test.json?key=invalid")
+
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.Equal(t, http.StatusUnauthorized, model.Code)
 	assert.Equal(t, "permission denied", model.Text)
@@ -19,38 +26,82 @@ func TestRouteIdsForAgencyRequiresValidApiKey(t *testing.T) {
 func TestRouteIdsForAgencyEndToEnd(t *testing.T) {
 	api := createTestApi(t)
 	defer api.Shutdown()
-	agencies := api.GtfsManager.GetAgencies()
-	require.NotEmpty(t, agencies)
-	agencyId := agencies[0].Id
 
-	resp, model := serveApiAndRetrieveEndpoint(t, api, "/api/where/route-ids-for-agency/"+agencyId+".json?key=TEST")
+	resp, model := callAPIHandler[RouteIDsForAgencyResponse](t, api, "/api/where/route-ids-for-agency/"+testdata.Raba.ID+".json?key=TEST")
+
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, 200, model.Code)
+	assert.Equal(t, http.StatusOK, model.Code)
 	assert.Equal(t, "OK", model.Text)
+	assert.Equal(t, 2, model.Version)
+	assert.Greater(t, model.CurrentTime, int64(0))
 
-	data, ok := model.Data.(map[string]interface{})
-
-	require.True(t, ok)
-	list, ok := data["list"].([]interface{})
-	require.True(t, ok)
-	assert.NotEmpty(t, list)
-
-	for _, routeId := range list {
-		routeIdStr, ok := routeId.(string)
-		require.True(t, ok)
-		assert.True(t, strings.HasPrefix(routeIdStr, agencyId+"_"),
-			"Route ID should start with agency ID prefix: %s", routeIdStr)
+	expected := make([]string, 0, len(testdata.RabaRoutes))
+	for _, r := range testdata.RabaRoutes {
+		expected = append(expected, r.ID)
 	}
-
-	refs, ok := data["references"].(map[string]interface{})
-	require.True(t, ok)
-	agencyRefs, ok := refs["agencies"].([]interface{})
-	require.True(t, ok)
-	assert.Len(t, agencyRefs, 0)
+	assert.ElementsMatch(t, expected, model.Data.List)
+	assert.False(t, model.Data.LimitExceeded)
+	assert.Empty(t, model.Data.References.Agencies)
+	assert.Empty(t, model.Data.References.Routes)
+	assert.Empty(t, model.Data.References.Stops)
+	assert.Empty(t, model.Data.References.Trips)
+	assert.Empty(t, model.Data.References.Situations)
+	assert.Empty(t, model.Data.References.StopTimes)
 }
 
 func TestInvalidAgencyIdForRouteIds(t *testing.T) {
-	_, resp, model := serveAndRetrieveEndpoint(t, "/api/where/route-ids-for-agency/invalid.json?key=TEST")
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	resp, model := callAPIHandler[RouteIDsForAgencyResponse](t, api, "/api/where/route-ids-for-agency/invalid.json?key=TEST")
+
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, model.Code)
+	assert.Equal(t, "resource not found", model.Text)
+}
+
+func TestMalformedAgencyIdForRouteIds(t *testing.T) {
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	resp, model := callAPIHandler[RouteIDsForAgencyResponse](t, api, "/api/where/route-ids-for-agency/bad@agency.json?key=TEST")
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, http.StatusBadRequest, model.Code)
+}
+
+func TestAgencyWithNoRoutesReturnsEmptyList(t *testing.T) {
+	api := createTestApi(t)
+	defer api.Shutdown()
+
+	ctx := context.Background()
+
+	_, err := api.GtfsManager.GtfsDB.Queries.CreateAgency(ctx, gtfsdb.CreateAgencyParams{
+		ID:       "no-routes-agency",
+		Name:     "No Routes Agency",
+		Url:      "http://example.com",
+		Timezone: "America/New_York",
+		Lang:     sql.NullString{String: "en", Valid: true},
+	})
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_, _ = api.GtfsManager.GtfsDB.DB.ExecContext(ctx, "DELETE FROM agencies WHERE id = ?", "no-routes-agency")
+	})
+
+	resp, model := callAPIHandler[RouteIDsForAgencyResponse](t, api, "/api/where/route-ids-for-agency/no-routes-agency.json?key=TEST")
+
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, "", model.Text)
+	assert.Equal(t, http.StatusOK, model.Code)
+	assert.Equal(t, "OK", model.Text)
+	assert.Empty(t, model.Data.List)
+	assert.False(t, model.Data.LimitExceeded)
+	assert.Equal(t, 2, model.Version)
+	assert.Greater(t, model.CurrentTime, int64(0))
+	assert.Empty(t, model.Data.References.Agencies)
+	assert.Empty(t, model.Data.References.Routes)
+	assert.Empty(t, model.Data.References.Stops)
+	assert.Empty(t, model.Data.References.Trips)
+	assert.Empty(t, model.Data.References.Situations)
+	assert.Empty(t, model.Data.References.StopTimes)
 }

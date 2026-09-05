@@ -23,6 +23,8 @@ func TestLoadFromFile_ValidConfig(t *testing.T) {
 	assert.Equal(t, "https://www.soundtransit.org/GTFS-rail/40_gtfs.zip", config.GtfsStaticFeed.URL)
 	assert.Equal(t, "./gtfs.db", config.DataPath)
 	assert.Len(t, config.GtfsRtFeeds, 1)
+	assert.Equal(t, "info", config.LogLevel)
+	assert.Equal(t, "text", config.LogFormat)
 }
 
 func TestLoadFromFile_FullConfig(t *testing.T) {
@@ -36,6 +38,8 @@ func TestLoadFromFile_FullConfig(t *testing.T) {
 	assert.Equal(t, []string{"key1", "key2", "key3"}, config.ApiKeys)
 	assert.Equal(t, []string{"protected-key-1", "protected-key-2"}, config.ProtectedApiKeys)
 	assert.Equal(t, 50, config.RateLimit)
+	assert.Equal(t, "debug", config.LogLevel)
+	assert.Equal(t, "json", config.LogFormat)
 	assert.Equal(t, "https://example.com/gtfs.zip", config.GtfsStaticFeed.URL)
 	assert.Equal(t, "Authorization", config.GtfsStaticFeed.AuthHeaderName)
 	assert.Equal(t, "Bearer token456", config.GtfsStaticFeed.AuthHeaderValue)
@@ -124,6 +128,40 @@ func TestValidate_InvalidRateLimit(t *testing.T) {
 	assert.Contains(t, err.Error(), "rate-limit must be at least 1")
 }
 
+func TestValidate_InvalidLogLevel(t *testing.T) {
+	config := &JSONConfig{
+		Port:             4000,
+		Env:              "development",
+		ApiKeys:          []string{"test"},
+		ProtectedApiKeys: []string{"test"},
+		RateLimit:        1,
+		LogLevel:         "other",
+		LogFormat:        "text",
+		DataPath:         "./gtfs.db",
+	}
+
+	err := config.Validate()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "log level must be one of")
+}
+
+func TestValidate_InvalidLogFormat(t *testing.T) {
+	config := &JSONConfig{
+		Port:             4000,
+		Env:              "development",
+		ApiKeys:          []string{"test"},
+		ProtectedApiKeys: []string{"test"},
+		RateLimit:        1,
+		LogLevel:         "info",
+		LogFormat:        "other",
+		DataPath:         "./gtfs.db",
+	}
+
+	err := config.Validate()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "log format must be one of")
+}
+
 func TestValidate_EmptyApiKeys(t *testing.T) {
 	config := &JSONConfig{
 		Port:             4000,
@@ -178,7 +216,6 @@ func TestToAppConfig(t *testing.T) {
 	assert.Equal(t, Production, appConfig.Env)
 	assert.Equal(t, []string{"key1", "key2"}, appConfig.ApiKeys)
 	assert.Equal(t, 50, appConfig.RateLimit)
-	assert.True(t, appConfig.Verbose)
 	assert.Equal(t, []string{"exempt-key-1"}, appConfig.ExemptApiKeys)
 }
 
@@ -229,7 +266,6 @@ func TestToGtfsConfigData_NoFeeds(t *testing.T) {
 	assert.Equal(t, "secret123", gtfsConfig.StaticAuthHeaderValue)
 	assert.Equal(t, "/data/gtfs.db", gtfsConfig.GTFSDataPath)
 	assert.Equal(t, Development, gtfsConfig.Env)
-	assert.True(t, gtfsConfig.Verbose)
 
 	// No feeds should result in empty RTFeeds
 	assert.Empty(t, gtfsConfig.RTFeeds)
@@ -338,6 +374,8 @@ func TestValidate_PathTraversalDataPath(t *testing.T) {
 				ProtectedApiKeys: []string{"test"},
 				RateLimit:        100,
 				DataPath:         tt.dataPath,
+				LogLevel:         "info",
+				LogFormat:        "text",
 			}
 			err := config.Validate()
 			if tt.shouldErr {
@@ -372,6 +410,8 @@ func TestValidate_FileURLNotAllowed(t *testing.T) {
 				GtfsStaticFeed: GtfsStaticFeed{
 					URL: tt.gtfsURL,
 				},
+				LogLevel:  "info",
+				LogFormat: "text",
 			}
 			err := config.Validate()
 			assert.Error(t, err)
@@ -408,6 +448,8 @@ func TestValidate_PathTraversalGtfsURL(t *testing.T) {
 				GtfsStaticFeed: GtfsStaticFeed{
 					URL: tt.gtfsURL,
 				},
+				LogLevel:  "info",
+				LogFormat: "text",
 			}
 			err := config.Validate()
 			if tt.shouldErr {
@@ -442,7 +484,9 @@ func TestValidate_ValidAbsolutePaths(t *testing.T) {
 				GtfsStaticFeed: GtfsStaticFeed{
 					URL: tt.gtfsURL,
 				},
-				DataPath: "./gtfs.db",
+				DataPath:  "./gtfs.db",
+				LogLevel:  "info",
+				LogFormat: "text",
 			}
 			err := config.Validate()
 			if tt.valid {
@@ -480,7 +524,9 @@ func TestValidate_PartialAuthHeaders(t *testing.T) {
 					AuthHeaderName:  tt.authName,
 					AuthHeaderValue: tt.authValue,
 				},
-				DataPath: "./gtfs.db",
+				DataPath:  "./gtfs.db",
+				LogLevel:  "info",
+				LogFormat: "text",
 			}
 			err := config.Validate()
 			if tt.shouldError {
@@ -543,6 +589,8 @@ func TestLoadFromFile_EnvVarOverrides(t *testing.T) {
 		t.Setenv("GTFS_STATIC_AUTH_VALUE", "env-static-secret")
 		t.Setenv("GTFS_REALTIME_AUTH_NAME", "X-Env-RT")
 		t.Setenv("GTFS_REALTIME_AUTH_VALUE", "env-rt-secret")
+		t.Setenv("MAGLEV_LOG_LEVEL", "debug")
+		t.Setenv("MAGLEV_LOG_FORMAT", "json")
 
 		config, err := LoadFromFile(tmpFile.Name())
 		require.NoError(t, err)
@@ -555,6 +603,8 @@ func TestLoadFromFile_EnvVarOverrides(t *testing.T) {
 		require.NotEmpty(t, config.GtfsRtFeeds)
 		assert.Equal(t, "X-Env-RT", config.GtfsRtFeeds[0].RealTimeAuthHeaderName)
 		assert.Equal(t, "env-rt-secret", config.GtfsRtFeeds[0].RealTimeAuthHeaderValue)
+		assert.Equal(t, "debug", config.LogLevel)
+		assert.Equal(t, "json", config.LogFormat)
 	})
 
 	t.Run("Parsing Edge Cases - Spaces and Empty Segments", func(t *testing.T) {
@@ -593,4 +643,34 @@ func TestLoadFromFile_EnvVarOverrides(t *testing.T) {
 		assert.Equal(t, "Env-Name", config.GtfsStaticFeed.AuthHeaderName)
 		assert.Equal(t, "Env-Value", config.GtfsStaticFeed.AuthHeaderValue)
 	})
+}
+
+func TestToGtfsConfigData_NoDuplicates(t *testing.T) {
+	// Passing unique IDs
+	j := &JSONConfig{
+		GtfsRtFeeds: []GtfsRtFeed{
+			{ID: "feed-1"},
+			{ID: "feed-2"},
+		},
+	}
+
+	cfg, err := j.ToGtfsConfigData()
+
+	assert.NoError(t, err)
+	assert.Len(t, cfg.RTFeeds, 2)
+}
+
+func TestToGtfsConfigData_DuplicateIDs(t *testing.T) {
+	// Passing duplicate IDs
+	j := &JSONConfig{
+		GtfsRtFeeds: []GtfsRtFeed{
+			{ID: "feed-1"},
+			{ID: "feed-1"},
+		},
+	}
+
+	_, err := j.ToGtfsConfigData()
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate feed ID")
 }

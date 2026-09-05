@@ -1,12 +1,12 @@
 package gtfsdb
 
-import "maglev.onebusaway.org/internal/appconf"
+import (
+	"fmt"
+
+	"maglev.onebusaway.org/internal/appconf"
+)
 
 const (
-	// DefaultBulkInsertBatchSize is the fallback batch size used when fieldsPerRow is
-	// unknown or <= 0.
-	DefaultBulkInsertBatchSize = 3000
-
 	// sqliteMaxVariables is the hard upper bound on bound parameters per SQLite
 	// statement (SQLITE_MAX_VARIABLE_NUMBER).
 	sqliteMaxVariables = 32766
@@ -15,23 +15,22 @@ const (
 // Config holds configuration options for the Client
 type Config struct {
 	// Database configuration
-	DBPath  string              // Path to SQLite database file
-	Env     appconf.Environment // Environment name: development, test, production.
-	verbose bool                // Enable verbose logging
-
-	// Performance tuning
-	// BulkInsertBatchSize is reserved for future use. Batch sizes are now computed
-	// automatically via SafeBatchSize based on SQLITE_MAX_VARIABLE_NUMBER (32766)
-	// and the number of fields bound per row.
-	BulkInsertBatchSize int
+	DBPath string              // Path to SQLite database file
+	Env    appconf.Environment // Environment name: development, test, production.
+	// Optional recorder for DB query metrics.
+	QueryMetricsRecorder DBQueryMetricsRecorder
 }
 
-func NewConfig(dbPath string, env appconf.Environment, verbose bool) Config {
+// DBQueryMetricsRecorder is a minimal abstraction used to emit per-query metrics
+// without coupling gtfsdb to a specific metrics implementation.
+type DBQueryMetricsRecorder interface {
+	RecordDBQuery(queryName, op string, err error)
+}
+
+func NewConfig(dbPath string, env appconf.Environment) Config {
 	return Config{
-		DBPath:              dbPath,
-		Env:                 env,
-		verbose:             verbose,
-		BulkInsertBatchSize: DefaultBulkInsertBatchSize,
+		DBPath: dbPath,
+		Env:    env,
 	}
 }
 
@@ -39,10 +38,11 @@ func NewConfig(dbPath string, env appconf.Environment, verbose bool) Config {
 // the number of parameters bound per row. SQLite enforces a hard upper bound of
 // SQLITE_MAX_VARIABLE_NUMBER (32766) bound parameters per statement, so the safe
 // maximum is 32766 / fieldsPerRow.
-// If fieldsPerRow is <= 0, DefaultBulkInsertBatchSize is returned as a fallback.
+// Panics if fieldsPerRow <= 0 as this always indicates a programming error —
+// fieldsPerRow is a compile-time constant that must match the INSERT column list.
 func (c Config) SafeBatchSize(fieldsPerRow int) int {
 	if fieldsPerRow <= 0 {
-		return DefaultBulkInsertBatchSize
+		panic(fmt.Sprintf("SafeBatchSize: fieldsPerRow must be > 0, got %d", fieldsPerRow))
 	}
 	return sqliteMaxVariables / fieldsPerRow
 }

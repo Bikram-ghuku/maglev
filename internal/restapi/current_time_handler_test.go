@@ -1,12 +1,19 @@
 package restapi
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"maglev.onebusaway.org/internal/app"
 	"maglev.onebusaway.org/internal/clock"
+	"maglev.onebusaway.org/internal/models"
 )
 
 func TestCurrentTimeHandlerRequiresValidApiKey(t *testing.T) {
@@ -26,7 +33,7 @@ func TestCurrentTimeHandler(t *testing.T) {
 	// Check basic response structure
 	assert.Equal(t, http.StatusOK, model.Code)
 	assert.Equal(t, "OK", model.Text)
-	assert.Equal(t, 2, model.Version)
+	assert.Equal(t, models.APIVersion, model.Version)
 
 	// Get the current time to compare with response time
 	now := time.Now().UnixNano() / int64(time.Millisecond)
@@ -37,11 +44,11 @@ func TestCurrentTimeHandler(t *testing.T) {
 
 	// Test the data structure
 	// First, we need to cast the interface{} to the expected type
-	responseData, ok := model.Data.(map[string]interface{})
+	responseData, ok := model.Data.(map[string]any)
 	assert.True(t, ok, "could not cast data to expected type")
 
 	// Check that entry exists
-	entry, ok := responseData["entry"].(map[string]interface{})
+	entry, ok := responseData["entry"].(map[string]any)
 	assert.True(t, ok, "could not find entry in response data")
 
 	// Check that time and readableTime exist in entry
@@ -52,13 +59,13 @@ func TestCurrentTimeHandler(t *testing.T) {
 	assert.True(t, ok, "could not find readableTime in entry")
 
 	// Check that references exist and have the expected structure
-	references, ok := responseData["references"].(map[string]interface{})
+	references, ok := responseData["references"].(map[string]any)
 	assert.True(t, ok, "could not find references in response data")
 
 	// Check that all expected arrays exist in references
 	referencesFields := []string{"agencies", "routes", "situations", "stopTimes", "stops", "trips"}
 	for _, field := range referencesFields {
-		array, ok := references[field].([]interface{})
+		array, ok := references[field].([]any)
 		assert.True(t, ok, "could not find %s array in references", field)
 		assert.Equal(t, 0, len(array), "expected empty %s array, got length %d", field, len(array))
 	}
@@ -80,11 +87,68 @@ func TestCurrentTimeHandler_DeterministicTime(t *testing.T) {
 	assert.Equal(t, expectedMs, response.CurrentTime, "Response currentTime should equal mock clock time")
 
 	// Entry time should also match
-	responseData := response.Data.(map[string]interface{})
-	entry := responseData["entry"].(map[string]interface{})
+	responseData := response.Data.(map[string]any)
+	entry := responseData["entry"].(map[string]any)
 	assert.Equal(t, float64(expectedMs), entry["time"], "Entry time should equal mock clock time")
 
-	// Readable time should match
-	expectedReadable := fixedTime.Format(time.RFC3339)
-	assert.Equal(t, expectedReadable, entry["readableTime"], "Readable time should match mock clock")
+	// readableTime must be formatted in the agency's local timezone (America/Los_Angeles).
+	agencyLoc, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+	expectedReadable := fixedTime.In(agencyLoc).Format(time.RFC3339)
+	assert.Equal(t, expectedReadable, entry["readableTime"], "readableTime should use agency timezone")
+}
+
+func TestAgencyTimezone_EmptyAgencies(t *testing.T) {
+	manager := newTestManagerNoData(t)
+	manager.MarkReady()
+
+	application := &app.Application{
+		GtfsManager: manager,
+		Clock:       clock.RealClock{},
+	}
+	api := NewRestAPI(application)
+	api.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	loc := agencyTimezone(api, req)
+	assert.Equal(t, time.UTC, loc)
+}
+
+func TestAgencyTimezone_InvalidTimezone(t *testing.T) {
+	manager := newTestManagerNoData(t)
+	manager.MarkReady()
+
+	_, err := manager.GtfsDB.DB.ExecContext(context.Background(),
+		`INSERT INTO agencies (id, name, url, timezone) VALUES (?, ?, ?, ?)`,
+		"test-agency", "Test Agency", "http://example.com", "Not/AReal_Timezone",
+	)
+	require.NoError(t, err)
+
+	application := &app.Application{
+		GtfsManager: manager,
+		Clock:       clock.RealClock{},
+	}
+	api := NewRestAPI(application)
+	api.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	loc := agencyTimezone(api, req)
+	assert.Equal(t, time.UTC, loc)
+}
+
+func TestAgencyTimezone_DBError(t *testing.T) {
+	manager := newTestManagerNoData(t)
+	manager.MarkReady()
+	require.NoError(t, manager.GtfsDB.Close())
+
+	application := &app.Application{
+		GtfsManager: manager,
+		Clock:       clock.RealClock{},
+	}
+	api := NewRestAPI(application)
+	api.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	loc := agencyTimezone(api, req)
+	assert.Equal(t, time.UTC, loc)
 }

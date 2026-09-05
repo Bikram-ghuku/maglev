@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // CGo-based SQLite driver
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"maglev.onebusaway.org/internal/app"
@@ -68,6 +67,8 @@ func TestParseAPIKeys(t *testing.T) {
 }
 
 func TestBuildApplicationWithMemoryDB(t *testing.T) {
+	ctx := context.Background()
+
 	// Get path to test data
 	testDataPath := filepath.Join("..", "..", "testdata", "raba.zip")
 
@@ -77,29 +78,34 @@ func TestBuildApplicationWithMemoryDB(t *testing.T) {
 	}
 
 	cfg := appconf.Config{
-		Port:      4000,
-		Env:       appconf.Test,
-		ApiKeys:   []string{"test"},
-		Verbose:   false,
+		Port:    4000,
+		Env:     appconf.Test,
+		ApiKeys: []string{"test"},
+
 		RateLimit: 100,
 	}
 
 	gtfsCfg := gtfs.Config{
 		GTFSDataPath: ":memory:",
 		GtfsURL:      testDataPath,
-		Verbose:      false,
 	}
 
-	coreApp, err := BuildApplication(cfg, gtfsCfg)
+	coreApp, err := BuildApplication(ctx, cfg, gtfsCfg)
 
 	require.NoError(t, err, "BuildApplication should not return an error")
 	assert.NotNil(t, coreApp, "Application should not be nil")
 	assert.NotNil(t, coreApp.Logger, "Logger should be initialized")
 	assert.Equal(t, cfg, coreApp.Config, "Config should match input")
+
+	// BuildApplication injects the metrics client into the config.
+	// We sync the injected Metrics over to our local copy so the assertion passes.
+	gtfsCfg.Metrics = coreApp.GtfsConfig.Metrics
 	assert.Equal(t, gtfsCfg, coreApp.GtfsConfig, "GtfsConfig should match input")
 }
 
 func TestBuildApplicationWithTestData(t *testing.T) {
+	ctx := context.Background()
+
 	// Get path to test data
 	testDataPath := filepath.Join("..", "..", "testdata", "raba.zip")
 
@@ -109,20 +115,19 @@ func TestBuildApplicationWithTestData(t *testing.T) {
 	}
 
 	cfg := appconf.Config{
-		Port:      4000,
-		Env:       appconf.Test,
-		ApiKeys:   []string{"test"},
-		Verbose:   false,
+		Port:    4000,
+		Env:     appconf.Test,
+		ApiKeys: []string{"test"},
+
 		RateLimit: 100,
 	}
 
 	gtfsCfg := gtfs.Config{
 		GTFSDataPath: ":memory:",
 		GtfsURL:      testDataPath,
-		Verbose:      false,
 	}
 
-	coreApp, err := BuildApplication(cfg, gtfsCfg)
+	coreApp, err := BuildApplication(ctx, cfg, gtfsCfg)
 
 	require.NoError(t, err, "BuildApplication should not return an error with test data")
 	assert.NotNil(t, coreApp, "Application should not be nil")
@@ -131,6 +136,7 @@ func TestBuildApplicationWithTestData(t *testing.T) {
 }
 
 func TestCreateServer(t *testing.T) {
+
 	// Get path to test data
 	testDataPath := filepath.Join("..", "..", "testdata", "raba.zip")
 
@@ -139,35 +145,65 @@ func TestCreateServer(t *testing.T) {
 		t.Skip("Test data not available, skipping test")
 	}
 
-	cfg := appconf.Config{
-		Port:      8080,
-		Env:       appconf.Test,
-		ApiKeys:   []string{"test"},
-		Verbose:   false,
-		RateLimit: 100,
+	tests := []struct {
+		name     string
+		host     string
+		port     int
+		wantAddr string
+	}{
+		{
+			name:     "empty host uses wildcard",
+			host:     "",
+			port:     8080,
+			wantAddr: ":8080",
+		},
+		{
+			name:     "configured host is used",
+			host:     "127.0.0.1",
+			port:     8080,
+			wantAddr: "127.0.0.1:8080",
+		},
+		{
+			name:     "IPv6 host is bracketed",
+			host:     "::1",
+			port:     8080,
+			wantAddr: "[::1]:8080",
+		},
 	}
 
-	gtfsCfg := gtfs.Config{
-		GTFSDataPath: ":memory:",
-		GtfsURL:      testDataPath,
-		Verbose:      false,
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := appconf.Config{
+				Port:      tt.port,
+				Host:      tt.host,
+				Env:       appconf.Test,
+				ApiKeys:   []string{"test"},
+				RateLimit: 100,
+			}
+			gtfsCfg := gtfs.Config{
+				GTFSDataPath: ":memory:",
+				GtfsURL:      testDataPath,
+			}
+			coreApp, err := BuildApplication(ctx, cfg, gtfsCfg)
+			require.NoError(t, err, "BuildApplication should not fail")
+
+			srv, api := CreateServer(coreApp, cfg)
+			defer api.Shutdown()
+
+			assert.NotNil(t, srv, "Server should not be nil")
+			assert.Equal(t, tt.wantAddr, srv.Addr, "Server address should match port and address")
+			assert.NotNil(t, srv.Handler, "Server handler should be set")
+			assert.Equal(t, time.Minute, srv.IdleTimeout, "IdleTimeout should be 1 minute")
+			assert.Equal(t, 5*time.Second, srv.ReadTimeout, "ReadTimeout should be 5 seconds")
+			assert.Equal(t, 10*time.Second, srv.WriteTimeout, "WriteTimeout should be 10 seconds")
+		})
 	}
-
-	coreApp, err := BuildApplication(cfg, gtfsCfg)
-	require.NoError(t, err, "BuildApplication should not fail")
-
-	srv, api := CreateServer(coreApp, cfg)
-	defer api.Shutdown()
-
-	assert.NotNil(t, srv, "Server should not be nil")
-	assert.Equal(t, ":8080", srv.Addr, "Server address should match port")
-	assert.NotNil(t, srv.Handler, "Server handler should be set")
-	assert.Equal(t, time.Minute, srv.IdleTimeout, "IdleTimeout should be 1 minute")
-	assert.Equal(t, 5*time.Second, srv.ReadTimeout, "ReadTimeout should be 5 seconds")
-	assert.Equal(t, 10*time.Second, srv.WriteTimeout, "WriteTimeout should be 10 seconds")
 }
 
 func TestCreateServerHandlerResponds(t *testing.T) {
+	ctx := context.Background()
+
 	// Get path to test data
 	testDataPath := filepath.Join("..", "..", "testdata", "raba.zip")
 
@@ -177,20 +213,19 @@ func TestCreateServerHandlerResponds(t *testing.T) {
 	}
 
 	cfg := appconf.Config{
-		Port:      8080,
-		Env:       appconf.Test,
-		ApiKeys:   []string{"test"},
-		Verbose:   false,
+		Port:    8080,
+		Env:     appconf.Test,
+		ApiKeys: []string{"test"},
+
 		RateLimit: 100,
 	}
 
 	gtfsCfg := gtfs.Config{
 		GTFSDataPath: ":memory:",
 		GtfsURL:      testDataPath,
-		Verbose:      false,
 	}
 
-	coreApp, err := BuildApplication(cfg, gtfsCfg)
+	coreApp, err := BuildApplication(ctx, cfg, gtfsCfg)
 	require.NoError(t, err, "BuildApplication should not fail")
 
 	srv, api := CreateServer(coreApp, cfg)
@@ -209,6 +244,8 @@ func TestCreateServerHandlerResponds(t *testing.T) {
 }
 
 func TestRunServerStartsAndStopsCleanly(t *testing.T) {
+	ctx := context.Background()
+
 	// This is a lightweight integration test to verify the Run function can start and stop
 	// We use a test HTTP server to avoid binding to real ports
 
@@ -221,20 +258,19 @@ func TestRunServerStartsAndStopsCleanly(t *testing.T) {
 	}
 
 	cfg := appconf.Config{
-		Port:      0, // Use port 0 to get a random available port
-		Env:       appconf.Test,
-		ApiKeys:   []string{"test"},
-		Verbose:   false,
+		Port:    0, // Use port 0 to get a random available port
+		Env:     appconf.Test,
+		ApiKeys: []string{"test"},
+
 		RateLimit: 100,
 	}
 
 	gtfsCfg := gtfs.Config{
 		GTFSDataPath: ":memory:",
 		GtfsURL:      testDataPath,
-		Verbose:      false,
 	}
 
-	coreApp, err := BuildApplication(cfg, gtfsCfg)
+	coreApp, err := BuildApplication(ctx, cfg, gtfsCfg)
 	require.NoError(t, err, "BuildApplication should not fail")
 
 	// Create a test server that we can control
@@ -298,6 +334,8 @@ func TestParseAPIKeysEdgeCases(t *testing.T) {
 }
 
 func TestRunWithPortZeroAndImmediateShutdown(t *testing.T) {
+	ctx := context.Background()
+
 	// This test verifies Run() can start and shutdown gracefully
 	testDataPath := filepath.Join("..", "..", "testdata", "raba.zip")
 	if _, err := os.Stat(testDataPath); os.IsNotExist(err) {
@@ -305,20 +343,19 @@ func TestRunWithPortZeroAndImmediateShutdown(t *testing.T) {
 	}
 
 	cfg := appconf.Config{
-		Port:      0, // Use random port to avoid conflicts
-		Env:       appconf.Test,
-		ApiKeys:   []string{"test"},
-		Verbose:   false,
+		Port:    0, // Use random port to avoid conflicts
+		Env:     appconf.Test,
+		ApiKeys: []string{"test"},
+
 		RateLimit: 100,
 	}
 
 	gtfsCfg := gtfs.Config{
 		GTFSDataPath: ":memory:",
 		GtfsURL:      testDataPath,
-		Verbose:      false,
 	}
 
-	coreApp, err := BuildApplication(cfg, gtfsCfg)
+	coreApp, err := BuildApplication(ctx, cfg, gtfsCfg)
 	require.NoError(t, err)
 
 	srv, api := CreateServer(coreApp, cfg)
@@ -355,22 +392,23 @@ func TestRunWithPortZeroAndImmediateShutdown(t *testing.T) {
 }
 
 func TestBuildApplicationErrorHandling(t *testing.T) {
+	ctx := context.Background()
+
 	t.Run("handles invalid GTFS path", func(t *testing.T) {
 		cfg := appconf.Config{
-			Port:      4000,
-			Env:       appconf.Test,
-			ApiKeys:   []string{"test"},
-			Verbose:   false,
+			Port:    4000,
+			Env:     appconf.Test,
+			ApiKeys: []string{"test"},
+
 			RateLimit: 100,
 		}
 
 		gtfsCfg := gtfs.Config{
 			GTFSDataPath: ":memory:",
 			GtfsURL:      "/nonexistent/path/to/gtfs.zip",
-			Verbose:      false,
 		}
 
-		_, err := BuildApplication(cfg, gtfsCfg)
+		_, err := BuildApplication(ctx, cfg, gtfsCfg)
 		assert.Error(t, err, "Should return error for invalid GTFS path")
 		assert.Contains(t, err.Error(), "failed to initialize GTFS manager")
 	})
@@ -392,11 +430,9 @@ func TestConfigFileLoading(t *testing.T) {
 		assert.Equal(t, appconf.Development, appCfg.Env)
 		assert.Equal(t, []string{"test"}, appCfg.ApiKeys)
 		assert.Equal(t, 100, appCfg.RateLimit)
-		assert.True(t, appCfg.Verbose)
 
 		// Verify GTFS config
 		assert.Equal(t, appconf.Development, gtfsCfgData.Env)
-		assert.True(t, gtfsCfgData.Verbose)
 	})
 
 	t.Run("loads full config file with GTFS-RT feed", func(t *testing.T) {
@@ -447,6 +483,8 @@ func TestConfigFileLoading(t *testing.T) {
 }
 
 func TestBuildApplicationWithConfigFile(t *testing.T) {
+	ctx := context.Background()
+
 	t.Run("builds app from valid config file", func(t *testing.T) {
 		// Skip if test data not available
 		testDataPath := filepath.Join("..", "..", "testdata", "raba.zip")
@@ -486,7 +524,7 @@ func TestBuildApplicationWithConfigFile(t *testing.T) {
 		gtfsCfg := gtfsConfigFromData(gtfsCfgData)
 
 		// Build application
-		coreApp, err := BuildApplication(cfg, gtfsCfg)
+		coreApp, err := BuildApplication(ctx, cfg, gtfsCfg)
 		require.NoError(t, err)
 		assert.NotNil(t, coreApp)
 		assert.NotNil(t, coreApp.Logger)
@@ -502,8 +540,9 @@ func TestRun_GracefulShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	coreApp := &app.Application{}
+	coreApp := &app.Application{
+		Logger: logger,
+	}
 
 	srv := &http.Server{
 		Addr: "127.0.0.1:0",
@@ -515,7 +554,7 @@ func TestRun_GracefulShutdown(t *testing.T) {
 	errCh := make(chan error, 1)
 
 	go func() {
-		errCh <- Run(ctx, srv, coreApp, nil, logger)
+		errCh <- Run(ctx, srv, coreApp, nil)
 	}()
 
 	// Small delay so ListenAndServe starts
@@ -571,28 +610,37 @@ func TestDumpConfigJSON_WithExampleFile(t *testing.T) {
 	output := buf.String()
 
 	// Parse and validate json
-	var parsed map[string]interface{}
+	var parsed map[string]any
 
 	err = json.Unmarshal([]byte(output), &parsed)
 	require.NoError(t, err, "Output is not a valid JSON")
 
 	assert.Equal(t, float64(cfg.Port), parsed["port"])
-	staticFeed, ok := parsed["gtfs-static-feed"].(map[string]interface{})
+	staticFeed, ok := parsed["gtfs-static-feed"].(map[string]any)
 	require.True(t, ok, "gtfs-static-feed should be a map")
 	assert.Equal(t, gtfsCfg.GtfsURL, staticFeed["url"])
 
-	feeds, ok := parsed["gtfs-rt-feeds"].([]interface{})
+	feeds, ok := parsed["gtfs-rt-feeds"].([]any)
 	require.True(t, ok, "gtfs-rt-feeds should be an array of maps")
 	assert.Equal(t, len(gtfsCfg.RTFeeds), len(feeds))
 
-	rtFeed, ok := feeds[0].(map[string]interface{})
+	rtFeed, ok := feeds[0].(map[string]any)
 	require.True(t, ok, "feeds[0] should be a map")
 
 	// Check that headers are redacted (:
-	headersMap, ok := rtFeed["headers"].(map[string]interface{})
+	headersMap, ok := rtFeed["headers"].(map[string]any)
 	require.True(t, ok, "headers should be a map")
 	assert.NotEqual(t, "my-secret-api-key", headersMap["X-API-Key"])
 	assert.Equal(t, "***REDACTED***", headersMap["X-API-Key"])
+
+	// Check that API keys are redacted
+	apiKeysStr, ok := parsed["api-keys"].(string)
+	require.True(t, ok, "api-keys should be a string")
+	assert.Contains(t, apiKeysStr, "REDACTED", "API keys should be redacted")
+
+	exemptApiKeysStr, ok := parsed["exempt-api-keys"].(string)
+	require.True(t, ok, "exempt-api-keys should be a string")
+	assert.Contains(t, exemptApiKeysStr, "REDACTED", "Exempt API keys should be redacted")
 
 	assert.NotEqual(t, "", rtFeed["trip-updates-url"])
 	assert.Equal(t, gtfsCfg.GTFSDataPath, parsed["data-path"])

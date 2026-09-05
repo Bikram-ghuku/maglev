@@ -11,8 +11,70 @@ import (
 	"github.com/OneBusAway/go-gtfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"maglev.onebusaway.org/internal/clock"
 	"maglev.onebusaway.org/internal/models"
 )
+
+// TestCalculateSecondsSinceServiceDate verifies that the function returns wall-clock
+// seconds (matching GTFS stop_time semantics) rather than real elapsed seconds, so
+// that DST transitions do not corrupt closest-stop and schedule-offset calculations.
+func TestCalculateSecondsSinceServiceDate(t *testing.T) {
+	// America/Los_Angeles observes DST:
+	//   Spring forward: 2nd Sunday of March (2025-03-09) — 2:00 AM PST → 3:00 AM PDT
+	//   Fall back:      1st Sunday of November (2024-11-03) — 2:00 AM PDT → 1:00 AM PST
+	la, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+
+	t.Run("normal day, same-day time", func(t *testing.T) {
+		// 2024-06-15 00:00:00 PDT (UTC-7)
+		serviceDate := time.Date(2024, 6, 15, 0, 0, 0, 0, la)
+		// 2024-06-15 08:30:00 PDT → 8*3600 + 30*60 = 30 600 wall-clock seconds
+		currentTime := time.Date(2024, 6, 15, 8, 30, 0, 0, la)
+		assert.Equal(t, int64(30600), CalculateSecondsSinceServiceDate(currentTime, serviceDate))
+	})
+
+	t.Run("DST fallback — first 1:30 AM (PDT, before clocks fall back)", func(t *testing.T) {
+		// Nov 3 2024: clocks go 2:00 AM PDT → 1:00 AM PST.
+		// Go's time.Date picks the earlier (summer/PDT) occurrence for ambiguous times.
+		serviceDate := time.Date(2024, 11, 3, 0, 0, 0, 0, la)  // midnight PDT
+		currentTime := time.Date(2024, 11, 3, 1, 30, 0, 0, la) // first 1:30 AM PDT
+		assert.Equal(t, int64(5400), CalculateSecondsSinceServiceDate(currentTime, serviceDate))
+	})
+
+	t.Run("DST fallback — second 1:30 AM (PST, after clocks fall back)", func(t *testing.T) {
+		// Construct the second 1:30 AM (PST) via an unambiguous anchor.
+		// 2:00 AM on Nov 3 only occurs once (as PST, after the fallback), so
+		// subtracting 30 minutes gives the second 1:30 AM without ambiguity.
+		// Real elapsed from midnight = 9000 s, but wall-clock is still 1:30 AM = 5400 s.
+		// GTFS only has one stop entry at 5400 s, so we must return 5400.
+		serviceDate := time.Date(2024, 11, 3, 0, 0, 0, 0, la)
+		twoAMAfterFallback := time.Date(2024, 11, 3, 2, 0, 0, 0, la) // unambiguous: 2:00 AM PST
+		currentTime := twoAMAfterFallback.Add(-30 * time.Minute)     // second 1:30 AM PST
+		assert.Equal(t, int64(5400), CalculateSecondsSinceServiceDate(currentTime, serviceDate))
+	})
+
+	t.Run("DST spring forward — time after the gap (3:30 AM PDT)", func(t *testing.T) {
+		// Mar 9 2025: clocks go 2:00 AM PST → 3:00 AM PDT.
+		// 3:30 AM PDT = 3*3600 + 30*60 = 12 600 wall-clock seconds.
+		serviceDate := time.Date(2025, 3, 9, 0, 0, 0, 0, la) // midnight PST
+		currentTime := time.Date(2025, 3, 9, 3, 30, 0, 0, la)
+		assert.Equal(t, int64(12600), CalculateSecondsSinceServiceDate(currentTime, serviceDate))
+	})
+
+	t.Run("overnight trip — 1:00 AM next day (25:00:00 in GTFS notation)", func(t *testing.T) {
+		// Service date is Jun 15; vehicle still running at 1:00 AM on Jun 16.
+		// GTFS would encode this as 25:00:00 = 90 000 s.
+		serviceDate := time.Date(2024, 6, 15, 0, 0, 0, 0, la)
+		currentTime := time.Date(2024, 6, 16, 1, 0, 0, 0, la)
+		assert.Equal(t, int64(90000), CalculateSecondsSinceServiceDate(currentTime, serviceDate))
+	})
+
+	t.Run("UTC timezone — no DST, result matches real elapsed seconds", func(t *testing.T) {
+		serviceDate := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC)
+		currentTime := time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
+		assert.Equal(t, int64(43200), CalculateSecondsSinceServiceDate(currentTime, serviceDate))
+	})
+}
 
 func TestExtractCodeID(t *testing.T) {
 	tests := []struct {
@@ -387,8 +449,9 @@ func TestParseTimeParameter(t *testing.T) {
 	loc, err := time.LoadLocation("America/Los_Angeles")
 	require.NoError(t, err)
 
-	// Get current time for testing
-	now := time.Now().In(loc)
+	// Use a fixed time for deterministic testing
+	now := time.Date(2025, 6, 12, 12, 0, 0, 0, loc)
+	testClock := clock.NewMockClock(now)
 	todayFormatted := now.Format("20060102")
 
 	// Calculate yesterday
@@ -469,11 +532,39 @@ func TestParseTimeParameter(t *testing.T) {
 				assert.Equal(t, tomorrow.Day(), parsedTime.Day())
 			},
 		},
+		{
+			name:         "Valid yyyy-MM-dd_HH-mm-ss format",
+			timeParam:    "2024-03-15_12-00-00",
+			expectedDate: "20240315",
+			expectError:  false,
+			validateParsedTime: func(t *testing.T, parsedTime time.Time) {
+				assert.Equal(t, 2024, parsedTime.Year())
+				assert.Equal(t, time.March, parsedTime.Month())
+				assert.Equal(t, 15, parsedTime.Day())
+				assert.Equal(t, 12, parsedTime.Hour())
+				assert.Equal(t, 0, parsedTime.Minute())
+				assert.Equal(t, 0, parsedTime.Second())
+			},
+		},
+		{
+			name:         "Valid yyyy-MM-dd_HH-mm-ss format with non-zero time",
+			timeParam:    "2024-06-20_14-30-45",
+			expectedDate: "20240620",
+			expectError:  false,
+			validateParsedTime: func(t *testing.T, parsedTime time.Time) {
+				assert.Equal(t, 2024, parsedTime.Year())
+				assert.Equal(t, time.June, parsedTime.Month())
+				assert.Equal(t, 20, parsedTime.Day())
+				assert.Equal(t, 14, parsedTime.Hour())
+				assert.Equal(t, 30, parsedTime.Minute())
+				assert.Equal(t, 45, parsedTime.Second())
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dateStr, parsedTime, fieldErrors, valid := ParseTimeParameter(tt.timeParam, loc)
+			dateStr, parsedTime, fieldErrors, valid := ParseTimeParameter(tt.timeParam, loc, testClock)
 
 			if tt.expectError {
 				assert.False(t, valid)
@@ -501,7 +592,7 @@ func TestParseTimeParameter_EdgeCases(t *testing.T) {
 		todayMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 		todayDateStr := todayMidnight.Format("2006-01-02")
 
-		dateStr, parsedTime, fieldErrors, valid := ParseTimeParameter(todayDateStr, loc)
+		dateStr, parsedTime, fieldErrors, valid := ParseTimeParameter(todayDateStr, loc, clock.RealClock{})
 
 		assert.True(t, valid)
 		assert.Nil(t, fieldErrors)
@@ -512,7 +603,7 @@ func TestParseTimeParameter_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("Malformed YYYY-MM-DD", func(t *testing.T) {
-		_, _, fieldErrors, valid := ParseTimeParameter("2024-13-45", loc)
+		_, _, fieldErrors, valid := ParseTimeParameter("2024-13-45", loc, clock.RealClock{})
 
 		assert.False(t, valid)
 		assert.NotNil(t, fieldErrors)
@@ -520,7 +611,7 @@ func TestParseTimeParameter_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("Non-numeric epoch", func(t *testing.T) {
-		_, _, fieldErrors, valid := ParseTimeParameter("not-a-number", loc)
+		_, _, fieldErrors, valid := ParseTimeParameter("not-a-number", loc, clock.RealClock{})
 
 		assert.False(t, valid)
 		assert.NotNil(t, fieldErrors)
@@ -528,20 +619,54 @@ func TestParseTimeParameter_EdgeCases(t *testing.T) {
 	})
 }
 
-func TestLoadLocationWithUTCFallBack(t *testing.T) {
-	t.Run("Valid location", func(t *testing.T) {
-		loc := LoadLocationWithUTCFallBack("America/Los_Angeles", "test-agency")
+func TestParseTimeParameter_DateStringUsesProvidedLocation(t *testing.T) {
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
 
-		assert.NotNil(t, loc)
-		assert.Equal(t, "America/Los_Angeles", loc.String())
-	})
+	dateStr, parsedTime, fieldErrors, valid := ParseTimeParameter("2026-03-12", loc, clock.RealClock{})
 
-	t.Run("Invalid location falls back to UTC", func(t *testing.T) {
-		loc := LoadLocationWithUTCFallBack("Invalid/Timezone", "test-agency")
+	require.True(t, valid)
+	require.Nil(t, fieldErrors)
+	assert.Equal(t, "20260312", dateStr)
 
-		assert.NotNil(t, loc)
-		assert.Equal(t, time.UTC, loc)
-	})
+	expected := time.Date(2026, 3, 12, 0, 0, 0, 0, loc)
+	assert.True(t, parsedTime.Equal(expected), "parsed time should represent midnight in the provided location")
+	assert.Equal(t, loc.String(), parsedTime.Location().String())
+}
+
+func TestParseMaxCountClamped(t *testing.T) {
+	tests := []struct {
+		name             string
+		maxCount         string
+		expectedMaxCount int
+		expectError      bool
+	}{
+		{"omitted uses default", "", 100, false},
+		{"within cap unchanged", "10", 10, false},
+		{"at cap unchanged", "250", 250, false},
+		{"above cap clamps", "251", 250, false},
+		{"far above cap clamps", "10000", 250, false},
+		{"zero is an error", "0", 100, true},
+		{"negative is an error", "-1", 100, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := url.Values{}
+			if tt.maxCount != "" {
+				params.Set("maxCount", tt.maxCount)
+			}
+
+			maxCount, fieldErrors := ParseMaxCountClamped(params, 100, nil)
+
+			assert.Equal(t, tt.expectedMaxCount, maxCount)
+			if tt.expectError {
+				assert.Contains(t, fieldErrors, "maxCount")
+			} else {
+				assert.NotContains(t, fieldErrors, "maxCount")
+			}
+		})
+	}
 }
 
 func TestParseMaxCount(t *testing.T) {
@@ -912,6 +1037,178 @@ func TestValidateNumericParam(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := ValidateNumericParam(tt.input)
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestParseRequiredFloatParam(t *testing.T) {
+	t.Run("missing key returns error", func(t *testing.T) {
+		params := url.Values{}
+		val, fieldErrors := ParseRequiredFloatParam(params, "lat", nil)
+		assert.Equal(t, float64(0), val)
+		assert.Contains(t, fieldErrors["lat"][0], "Missing required field")
+	})
+	t.Run("present valid value is parsed correctly", func(t *testing.T) {
+		params := url.Values{"lat": []string{"40.583321"}}
+		val, fieldErrors := ParseRequiredFloatParam(params, "lat", nil)
+		assert.Equal(t, 40.583321, val)
+		assert.Empty(t, fieldErrors)
+	})
+	t.Run("present invalid value adds parse error", func(t *testing.T) {
+		params := url.Values{"lat": []string{"not-a-float"}}
+		val, fieldErrors := ParseRequiredFloatParam(params, "lat", nil)
+		assert.Equal(t, float64(0), val)
+		assert.Contains(t, fieldErrors["lat"][0], "Invalid field value")
+	})
+	t.Run("explicit zero is accepted (not treated as missing)", func(t *testing.T) {
+		params := url.Values{"lat": []string{"0.0"}}
+		val, fieldErrors := ParseRequiredFloatParam(params, "lat", nil)
+		assert.Equal(t, float64(0), val)
+		assert.Empty(t, fieldErrors)
+	})
+	t.Run("existing fieldErrors are preserved", func(t *testing.T) {
+		params := url.Values{}
+		existing := map[string][]string{"other": {"some error"}}
+		_, fieldErrors := ParseRequiredFloatParam(params, "lat", existing)
+		assert.Contains(t, fieldErrors["lat"][0], "Missing required field")
+		assert.Equal(t, []string{"some error"}, fieldErrors["other"])
+	})
+}
+
+func TestParseDate(t *testing.T) {
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatalf("Failed to load timezone America/Los_Angeles: %v", err)
+	}
+	expectedErrMsg := "invalid date format, use YYYY-MM-DD or a Unix millisecond integer"
+
+	tests := []struct {
+		name        string
+		date        string
+		wantErr     bool
+		errMsg      string
+		checkBounds bool // Set to true to check if output is normalized to midnight
+		wantDate    string
+	}{
+		{
+			name:        "valid date YYYY-MM-DD",
+			date:        "2023-12-25",
+			wantErr:     false,
+			checkBounds: true,
+			wantDate:    "2023-12-25",
+		},
+		{
+			name:        "valid unix timestamp (noon, rounds to midnight)",
+			date:        "1703534400000", // Dec 25, 2023 12:00:00 PM PST
+			wantErr:     false,
+			checkBounds: true,
+			wantDate:    "2023-12-25",
+		},
+		{
+			name:    "negative timestamp",
+			date:    "-1000",
+			wantErr: true,
+			errMsg:  "unix millisecond timestamp out of reasonable bounds",
+		},
+		{
+			name:    "extremely large timestamp",
+			date:    "999999999999999999",
+			wantErr: true,
+			errMsg:  "unix millisecond timestamp out of reasonable bounds",
+		},
+		{
+			name:    "invalid date format",
+			date:    "12/25/2023",
+			wantErr: true,
+			errMsg:  expectedErrMsg,
+		},
+		{
+			name:    "empty date",
+			date:    "",
+			wantErr: true,
+			errMsg:  "date cannot be empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsedTime, err := ParseDate(tt.date, loc)
+			if tt.wantErr {
+				if assert.Error(t, err) {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				assert.NoError(t, err)
+				if tt.checkBounds {
+					// Verify the time was snapped to midnight
+					hour, min, sec := parsedTime.Clock()
+					assert.Equal(t, 0, hour)
+					assert.Equal(t, 0, min)
+					assert.Equal(t, 0, sec)
+					assert.Equal(t, tt.wantDate, parsedTime.In(loc).Format("2006-01-02"))
+					assert.Equal(t, loc.String(), parsedTime.Location().String())
+				}
+			}
+		})
+	}
+}
+
+func TestClampRadius(t *testing.T) {
+	assert.Equal(t, 5000.0, ClampRadius(5000.0))
+	assert.Equal(t, float64(models.MaxSearchRadiusInMeters), ClampRadius(models.MaxSearchRadiusInMeters+10000.0))
+}
+
+func TestParseBoolParam(t *testing.T) {
+	tests := []struct {
+		name          string
+		params        url.Values
+		fallback      bool
+		expectedValue bool
+		expectError   bool
+	}{
+		{
+			name:          "Explicit true overrides the fallback",
+			params:        url.Values{"includeTrip": []string{"true"}},
+			fallback:      false,
+			expectedValue: true,
+		},
+		{
+			name:          "Explicit false overrides the fallback",
+			params:        url.Values{"includeTrip": []string{"false"}},
+			fallback:      true,
+			expectedValue: false,
+		},
+		{
+			name:          "Missing parameter takes the fallback",
+			params:        url.Values{},
+			fallback:      true,
+			expectedValue: true,
+		},
+		{
+			name:          "Empty value takes the fallback",
+			params:        url.Values{"includeTrip": []string{""}},
+			fallback:      true,
+			expectedValue: true,
+		},
+		{
+			name:          "Non-boolean value errors and keeps the fallback",
+			params:        url.Values{"includeTrip": []string{"maybe"}},
+			fallback:      true,
+			expectedValue: true,
+			expectError:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value, fieldErrors := ParseBoolParam(tt.params, "includeTrip", tt.fallback, nil)
+
+			assert.Equal(t, tt.expectedValue, value)
+			if tt.expectError {
+				assert.Contains(t, fieldErrors, "includeTrip")
+			} else {
+				assert.Empty(t, fieldErrors)
+			}
 		})
 	}
 }

@@ -1,28 +1,28 @@
 package restapi
 
 import (
-	"log/slog"
 	"net/http"
 
 	"maglev.onebusaway.org/gtfsdb"
 	"maglev.onebusaway.org/internal/logging"
 	"maglev.onebusaway.org/internal/models"
+	"maglev.onebusaway.org/internal/nulls"
 	"maglev.onebusaway.org/internal/utils"
 )
 
+// reportProblemWithTripHandler accepts a user-submitted problem report for a specific trip
+// and persists it to the database.
 func (api *RestAPI) reportProblemWithTripHandler(w http.ResponseWriter, r *http.Request) {
-	logger := api.Logger
-	if logger == nil {
-		logger = slog.Default()
+	agencyID, tripID, ok := api.extractAndValidateAgencyCodeID(w, r)
+	if !ok {
+		return
 	}
-
-	parsed, _ := utils.GetParsedIDFromContext(r.Context())
-	tripID := parsed.CodeID          // The raw GTFS trip ID (e.g., "t_123")
-	compositeID := parsed.CombinedID // The API ID (e.g., "1_t_123")
+	// The raw GTFS trip ID (e.g., "t_123")
+	compositeID := utils.FormCombinedID(agencyID, tripID) // The API ID (e.g., "1_t_123")
 
 	// Safety check: Ensure DB is initialized
 	if api.GtfsManager == nil || api.GtfsManager.GtfsDB == nil || api.GtfsManager.GtfsDB.Queries == nil {
-		logger.Error("report problem with trip failed: GTFS DB not initialized")
+		api.Logger.Error("report problem with trip failed: GTFS DB not initialized")
 		http.Error(w, `{"code":500, "text":"internal server error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -41,43 +41,37 @@ func (api *RestAPI) reportProblemWithTripHandler(w http.ResponseWriter, r *http.
 	userLocationAccuracy := utils.ValidateNumericParam(query.Get("userLocationAccuracy"))
 
 	// Log the problem report for observability
-	logger = logging.FromContext(r.Context()).With(slog.String("component", "problem_reporting"))
-	logging.LogOperation(logger, "problem_report_received_for_trip",
-		slog.String("trip_id", tripID),
-		slog.String("composite_id", compositeID),
-		slog.String("code", code),
-		slog.String("service_date", serviceDate),
-		slog.String("vehicle_id", vehicleID),
-		slog.String("stop_id", stopID),
-		slog.String("user_comment", userComment),
-		slog.String("user_on_vehicle", userOnVehicle),
-		slog.String("user_vehicle_number", userVehicleNumber),
-		slog.String("user_lat", userLatStr),
-		slog.String("user_lon", userLonStr),
-		slog.String("user_location_accuracy", userLocationAccuracy))
+	logger := logging.FromContext(r.Context()).With("component", "problem_reporting")
+	logger.Info("problem_report_received_for_trip",
+		"trip_id", tripID,
+		"composite_id", compositeID,
+		"code", code,
+		"service_date", serviceDate,
+		"vehicle_id", vehicleID,
+		"stop_id", stopID)
 
 	// Store the problem report in the database
 	now := api.Clock.Now().UnixMilli()
 	params := gtfsdb.CreateProblemReportTripParams{
 		TripID:               tripID,
-		ServiceDate:          gtfsdb.ToNullString(serviceDate),
-		VehicleID:            gtfsdb.ToNullString(vehicleID),
-		StopID:               gtfsdb.ToNullString(stopID),
-		Code:                 gtfsdb.ToNullString(code),
-		UserComment:          gtfsdb.ToNullString(userComment),
+		ServiceDate:          nulls.String(serviceDate),
+		VehicleID:            nulls.String(vehicleID),
+		StopID:               nulls.String(stopID),
+		Code:                 nulls.String(code),
+		UserComment:          nulls.String(userComment),
 		UserLat:              gtfsdb.ParseNullFloat(userLatStr),
 		UserLon:              gtfsdb.ParseNullFloat(userLonStr),
 		UserLocationAccuracy: gtfsdb.ParseNullFloat(userLocationAccuracy),
 		UserOnVehicle:        gtfsdb.ParseNullBool(userOnVehicle),
-		UserVehicleNumber:    gtfsdb.ToNullString(userVehicleNumber),
+		UserVehicleNumber:    nulls.String(userVehicleNumber),
 		CreatedAt:            now,
 		SubmittedAt:          now,
 	}
 
 	err := api.GtfsManager.GtfsDB.Queries.CreateProblemReportTrip(r.Context(), params)
 	if err != nil {
-		logging.LogError(logger, "failed to store problem report", err,
-			slog.String("trip_id", tripID))
+		logger.Error("failed to store problem report", "error", err,
+			"trip_id", tripID)
 		http.Error(w, `{"code":500, "text":"failed to store problem report"}`, http.StatusInternalServerError)
 		return
 	}

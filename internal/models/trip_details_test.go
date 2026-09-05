@@ -3,41 +3,36 @@ package models
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewTripDetails(t *testing.T) {
 	trip := Trip{
-		ID:             "trip_123",
-		RouteID:        "route_456",
-		ServiceID:      "service_789",
-		TripHeadsign:   "Downtown Terminal",
-		DirectionID:    1,
-		BlockID:        "block_1",
-		ShapeID:        "shape_1",
-		TripShortName:  "DT",
-		RouteShortName: "R1",
-		PeakOffPeak:    1,
-		TimeZone:       "America/Los_Angeles",
+		ID: "trip_123",
 	}
 
-	tripID := "trip_123"
-	serviceDate := int64(1609459200000)
+	tripID := trip.ID
+	serviceDate := time.UnixMilli(1609459200000)
 
 	frequency := &Frequency{
-		StartTime: 28800,
-		EndTime:   32400,
-		Headway:   300,
+		FrequencyWindow: FrequencyWindow{
+			StartTime: NewModelTime(serviceDate.Add(8 * time.Hour)),
+			EndTime:   NewModelTime(serviceDate.Add(9 * time.Hour)),
+			Headway:   NewModelDuration(300 * time.Second),
+		},
+		ExactTimes: 1,
 	}
 
-	status := &TripStatusForTripDetails{
+	status := &TripStatus{
 		VehicleID: "vehicle_789",
 		Status:    "in_progress",
 	}
 
 	schedule := &Schedule{
-		Frequency:      600,
+		Frequency:      nil,
 		NextTripID:     "next_trip",
 		PreviousTripID: "prev_trip",
 		StopTimes:      []StopTime{},
@@ -46,10 +41,10 @@ func TestNewTripDetails(t *testing.T) {
 
 	situationIDs := []string{"situation_1", "situation_2"}
 
-	tripDetails := NewTripDetails(trip, tripID, serviceDate, frequency, status, schedule, situationIDs)
+	tripDetails := NewTripDetails(tripID, serviceDate, frequency, status, schedule, situationIDs)
 
 	assert.Equal(t, tripID, tripDetails.TripID)
-	assert.Equal(t, serviceDate, tripDetails.ServiceDate)
+	assert.Equal(t, serviceDate, tripDetails.ServiceDate.Time)
 	assert.Equal(t, frequency, tripDetails.Frequency)
 	assert.Equal(t, status, tripDetails.Status)
 	assert.Equal(t, schedule, tripDetails.Schedule)
@@ -60,7 +55,7 @@ func TestNewEmptyTripDetails(t *testing.T) {
 	tripDetails := NewEmptyTripDetails()
 
 	assert.Equal(t, "", tripDetails.TripID)
-	assert.Equal(t, int64(0), tripDetails.ServiceDate)
+	assert.True(t, tripDetails.ServiceDate.IsZero())
 	assert.Nil(t, tripDetails.Frequency)
 	assert.Nil(t, tripDetails.Status)
 	assert.Nil(t, tripDetails.Schedule)
@@ -69,19 +64,22 @@ func TestNewEmptyTripDetails(t *testing.T) {
 }
 
 func TestTripDetailsJSON(t *testing.T) {
+	serviceDate := time.UnixMilli(1609459200000)
 	frequency := &Frequency{
-		StartTime: 28800,
-		EndTime:   32400,
-		Headway:   300,
+		FrequencyWindow: FrequencyWindow{
+			StartTime: NewModelTime(serviceDate.Add(8 * time.Hour)),
+			EndTime:   NewModelTime(serviceDate.Add(9 * time.Hour)),
+			Headway:   NewModelDuration(300 * time.Second),
+		},
+		ExactTimes: 1,
 	}
 
-	status := &TripStatusForTripDetails{
-		VehicleID: "vehicle_789",
-		Status:    "in_progress",
-	}
+	status := NewTripStatus()
+	status.VehicleID = "vehicle_789"
+	status.Status = "in_progress"
 
 	schedule := &Schedule{
-		Frequency:      600,
+		Frequency:      nil,
 		NextTripID:     "next_trip",
 		PreviousTripID: "prev_trip",
 		StopTimes:      []StopTime{},
@@ -90,7 +88,7 @@ func TestTripDetailsJSON(t *testing.T) {
 
 	tripDetails := TripDetails{
 		TripID:       "trip_123",
-		ServiceDate:  1609459200000,
+		ServiceDate:  NewModelTime(serviceDate),
 		Frequency:    frequency,
 		Status:       status,
 		Schedule:     schedule,
@@ -107,6 +105,10 @@ func TestTripDetailsJSON(t *testing.T) {
 	assert.Equal(t, tripDetails.TripID, unmarshaledTripDetails.TripID)
 	assert.Equal(t, tripDetails.ServiceDate, unmarshaledTripDetails.ServiceDate)
 	assert.NotNil(t, unmarshaledTripDetails.Frequency)
+	assert.Equal(t, frequency.ExactTimes, unmarshaledTripDetails.Frequency.ExactTimes)
+	assert.Equal(t, frequency.StartTime, unmarshaledTripDetails.Frequency.StartTime)
+	assert.Equal(t, frequency.EndTime, unmarshaledTripDetails.Frequency.EndTime)
+	assert.Equal(t, frequency.Headway, unmarshaledTripDetails.Frequency.Headway)
 	assert.NotNil(t, unmarshaledTripDetails.Status)
 	assert.NotNil(t, unmarshaledTripDetails.Schedule)
 	assert.Equal(t, tripDetails.SituationIDs, unmarshaledTripDetails.SituationIDs)
@@ -114,19 +116,20 @@ func TestTripDetailsJSON(t *testing.T) {
 
 func TestTripDetailsWithNilValues(t *testing.T) {
 	trip := Trip{ID: "trip_123"}
+	serviceDate := time.UnixMilli(1609459200000)
 
-	tripDetails := NewTripDetails(trip, "trip_123", 1609459200000, nil, nil, nil, nil)
+	tripDetails := NewTripDetails(trip.ID, serviceDate, nil, nil, nil, nil)
 
-	assert.Equal(t, "trip_123", tripDetails.TripID)
-	assert.Equal(t, int64(1609459200000), tripDetails.ServiceDate)
+	assert.Equal(t, trip.ID, tripDetails.TripID)
+	assert.Equal(t, serviceDate, tripDetails.ServiceDate.Time)
 	assert.Nil(t, tripDetails.Frequency)
 	assert.Nil(t, tripDetails.Status)
 	assert.Nil(t, tripDetails.Schedule)
 	assert.Nil(t, tripDetails.SituationIDs)
 }
 
-func TestTripStatusForTripDetailsJSON(t *testing.T) {
-	tripStatus := TripStatusForTripDetails{
+func TestTripStatusJSON(t *testing.T) {
+	tripStatus := TripStatus{
 		ActiveTripID:               "active_trip_123",
 		BlockTripSequence:          2,
 		ClosestStop:                "stop_456",
@@ -134,13 +137,13 @@ func TestTripStatusForTripDetailsJSON(t *testing.T) {
 		DistanceAlongTrip:          1500.5,
 		Frequency:                  nil,
 		LastKnownDistanceAlongTrip: 1400.0,
-		LastKnownLocation: Location{
+		LastKnownLocation: &Location{
 			Lat: 38.542661,
 			Lon: -121.743914,
 		},
 		LastKnownOrientation:   90.0,
-		LastLocationUpdateTime: 1609462700000,
-		LastUpdateTime:         1609462800000,
+		LastLocationUpdateTime: NewModelTime(time.UnixMilli(1609462700000)),
+		LastUpdateTime:         NewModelTime(time.UnixMilli(1609462800000)),
 		NextStop:               "stop_789",
 		NextStopTimeOffset:     240,
 		OccupancyCapacity:      50,
@@ -155,19 +158,19 @@ func TestTripStatusForTripDetailsJSON(t *testing.T) {
 		Predicted:                  true,
 		ScheduleDeviation:          60,
 		ScheduledDistanceAlongTrip: 1450.0,
-		ServiceDate:                1609459200000,
+		ServiceDate:                NewModelTime(time.UnixMilli(1609459200000)),
 		SituationIDs:               []string{"situation_1"},
 		Status:                     "SCHEDULED",
 		TotalDistanceAlongTrip:     5000.0,
 		VehicleFeatures:            []string{"wifi", "bike_rack"},
 		VehicleID:                  "vehicle_789",
-		Scheduled:                  true,
+		Scheduled:                  false,
 	}
 
 	jsonData, err := json.Marshal(tripStatus)
 	assert.NoError(t, err)
 
-	var unmarshaledStatus TripStatusForTripDetails
+	var unmarshaledStatus TripStatus
 	err = json.Unmarshal(jsonData, &unmarshaledStatus)
 	assert.NoError(t, err)
 
@@ -177,4 +180,64 @@ func TestTripStatusForTripDetailsJSON(t *testing.T) {
 	assert.Equal(t, tripStatus.Predicted, unmarshaledStatus.Predicted)
 	assert.Equal(t, tripStatus.Position.Lat, unmarshaledStatus.Position.Lat)
 	assert.Equal(t, tripStatus.Position.Lon, unmarshaledStatus.Position.Lon)
+	assert.Equal(t, tripStatus.Scheduled, unmarshaledStatus.Scheduled)
+}
+
+func TestTripStatus_JSONAlwaysPresent(t *testing.T) {
+	status := *NewTripStatus()
+	status.Status = DefaultTripStatusValue
+
+	data, err := json.Marshal(status)
+	require.NoError(t, err)
+	jsonStr := string(data)
+
+	// All fields must always be present in JSON (no omitempty on value types)
+	assert.Contains(t, jsonStr, `"scheduleDeviation":0`, "scheduleDeviation must always be present")
+	assert.Contains(t, jsonStr, `"distanceAlongTrip":0`, "distanceAlongTrip must always be present")
+	assert.Contains(t, jsonStr, `"closestStopTimeOffset":0`, "closestStopTimeOffset must always be present")
+	assert.Contains(t, jsonStr, `"orientation":0`, "orientation must always be present")
+	assert.Contains(t, jsonStr, `"lastKnownDistanceAlongTrip":0`, "lastKnownDistanceAlongTrip must always be present")
+	assert.Contains(t, jsonStr, `"lastKnownOrientation":0`, "lastKnownOrientation must always be present")
+	assert.Contains(t, jsonStr, `"lastLocationUpdateTime":0`, "lastLocationUpdateTime must always be present")
+	assert.Contains(t, jsonStr, `"lastUpdateTime":0`, "lastUpdateTime must always be present")
+	assert.Contains(t, jsonStr, `"totalDistanceAlongTrip":0`, "totalDistanceAlongTrip must always be present")
+	assert.Contains(t, jsonStr, `"scheduledDistanceAlongTrip":0`, "scheduledDistanceAlongTrip must always be present")
+	assert.Contains(t, jsonStr, `"occupancyCapacity":-1`, "occupancyCapacity must default to -1")
+	assert.Contains(t, jsonStr, `"occupancyCount":-1`, "occupancyCount must default to -1")
+	assert.Contains(t, jsonStr, `"vehicleFeatures":[]`, "vehicleFeatures must always be present as empty array")
+	assert.Contains(t, jsonStr, `"situationIds":[]`, "situationIds must always be present as empty array")
+
+	// String fields always present even when empty
+	assert.Contains(t, jsonStr, `"closestStop":""`, "closestStop must always be present")
+	assert.Contains(t, jsonStr, `"occupancyStatus":""`, "occupancyStatus must always be present")
+	assert.Contains(t, jsonStr, `"vehicleId":""`, "vehicleId must always be present")
+}
+
+func TestTripStatus_IsUntracked(t *testing.T) {
+	t.Run("default placeholder is untracked", func(t *testing.T) {
+		status := NewTripStatus()
+		status.Status = DefaultTripStatusValue
+		// NewTripStatus sets Predicted=false by default
+		assert.True(t, status.IsUntracked())
+	})
+
+	t.Run("predicted status is not untracked", func(t *testing.T) {
+		status := NewTripStatus()
+		status.Status = DefaultTripStatusValue
+		status.SetPredicted(true)
+		assert.False(t, status.IsUntracked())
+	})
+
+	t.Run("non-default status is not untracked", func(t *testing.T) {
+		status := NewTripStatus()
+		status.Status = "SCHEDULED"
+		assert.False(t, status.IsUntracked())
+	})
+
+	t.Run("active tracking is not untracked", func(t *testing.T) {
+		status := NewTripStatus()
+		status.Status = "in_progress"
+		status.SetPredicted(true)
+		assert.False(t, status.IsUntracked())
+	})
 }

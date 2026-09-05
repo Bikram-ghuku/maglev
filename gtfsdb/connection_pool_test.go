@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3" // CGo-based SQLite driver
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"maglev.onebusaway.org/internal/appconf"
@@ -14,9 +13,8 @@ import (
 func TestDatabaseConnectionPoolSettings(t *testing.T) {
 	// Test that database connection pool is configured with appropriate settings
 	config := Config{
-		DBPath:  ":memory:",
-		Env:     appconf.Test,
-		verbose: false,
+		DBPath: ":memory:",
+		Env:    appconf.Test,
 	}
 
 	client, err := NewClient(config)
@@ -40,9 +38,8 @@ func TestConnectionPoolBehavior(t *testing.T) {
 	// Test connection pool behavior - note that :memory: databases use only 1 connection
 	// so concurrent queries will be serialized
 	config := Config{
-		DBPath:  ":memory:",
-		Env:     appconf.Test,
-		verbose: false,
+		DBPath: ":memory:",
+		Env:    appconf.Test,
 	}
 
 	client, err := NewClient(config)
@@ -73,9 +70,8 @@ func TestConnectionPoolBehavior(t *testing.T) {
 func TestConnectionLifetime(t *testing.T) {
 	// Test that connection max lifetime is configured
 	config := Config{
-		DBPath:  ":memory:",
-		Env:     appconf.Test,
-		verbose: false,
+		DBPath: ":memory:",
+		Env:    appconf.Test,
 	}
 
 	client, err := NewClient(config)
@@ -103,7 +99,7 @@ func TestConnectionLifetime(t *testing.T) {
 
 func TestConnectionPoolConfiguration(t *testing.T) {
 	// Test the specific configuration values for in-memory databases
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open(DriverName, ":memory:")
 	require.NoError(t, err, "Should open database")
 	defer func() { _ = db.Close() }()
 

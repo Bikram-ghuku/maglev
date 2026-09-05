@@ -7,14 +7,31 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/OneBusAway/go-gtfs"
+	gtfsrt "github.com/OneBusAway/go-gtfs/proto"
 	"maglev.onebusaway.org/internal/logging"
 )
+
+// alertIndex holds pre-built maps for O(1) alert lookups, keyed by trip, route, agency, and stop IDs.
+// It is rebuilt on every call to rebuildMergedRealtimeLocked under the existing write lock.
+type alertIndex struct {
+	byTrip   map[string][]gtfs.Alert
+	byRoute  map[string][]gtfs.Alert
+	byAgency map[string][]gtfs.Alert
+	byStop   map[string][]gtfs.Alert
+}
+
+// staleVehicleTimeout is the duration after which a vehicle is considered stale
+const staleVehicleTimeout = 15 * time.Minute
+
+// staleFeedThreshold is the duration after which feed data is cleared if fetches keep failing
+const staleFeedThreshold = 5 * time.Minute
 
 // realtimeHTTPClient is a dedicated HTTP client for GTFS-RT feed fetching,
 // configured with explicit timeouts and transport limits to avoid the pitfalls
@@ -45,9 +62,6 @@ func newRealtimeHTTPClient() *http.Client {
 		Transport: transport,
 	}
 }
-
-// staleVehicleTimeout is the duration after which a vehicle is considered stale
-const staleVehicleTimeout = 15 * time.Minute
 
 // isVehicleStale returns true if the incoming vehicle update is older
 // than the existing vehicle based on GTFS-RT timestamps.
@@ -105,48 +119,32 @@ func (manager *Manager) GetRealTimeVehicles() []gtfs.Vehicle {
 	return manager.realTimeVehicles
 }
 
-func (manager *Manager) GetAlertsForRoute(routeID string) []gtfs.Alert {
-	manager.realTimeMutex.RLock()
-	defer manager.realTimeMutex.RUnlock()
-
-	var alerts []gtfs.Alert
-	for _, alert := range manager.realTimeAlerts {
-		if alert.InformedEntities != nil {
-			for _, entity := range alert.InformedEntities {
-				if entity.RouteID != nil && *entity.RouteID == routeID {
-					alerts = append(alerts, alert)
-					break
-				}
-			}
-		}
-	}
-	return alerts
-}
-
 // It acquires the realTimeMutex internally; callers must NOT hold it.
 func (manager *Manager) GetAlertsByIDs(tripID, routeID, agencyID string) []gtfs.Alert {
 	manager.realTimeMutex.RLock()
 	defer manager.realTimeMutex.RUnlock()
 
+	seen := make(map[string]struct{})
 	var alerts []gtfs.Alert
-	for _, alert := range manager.realTimeAlerts {
-		if alert.InformedEntities == nil {
-			continue
-		}
-		for _, entity := range alert.InformedEntities {
-			if entity.TripID != nil && tripID != "" && entity.TripID.ID == tripID {
-				alerts = append(alerts, alert)
-				break
-			}
-			if entity.RouteID != nil && routeID != "" && *entity.RouteID == routeID {
-				alerts = append(alerts, alert)
-				break
-			}
-			if entity.AgencyID != nil && agencyID != "" && *entity.AgencyID == agencyID {
-				alerts = append(alerts, alert)
-				break
+	// Invariant: alertIdx only contains alerts with non-empty IDs (rebuildMergedRealtimeLocked
+	// skips any alert where alert.ID == ""), so seen[a.ID] is sufficient for deduplication.
+	addUnique := func(candidates []gtfs.Alert) {
+		for _, a := range candidates {
+			if _, ok := seen[a.ID]; !ok {
+				seen[a.ID] = struct{}{}
+				alerts = append(alerts, a)
 			}
 		}
+	}
+
+	if tripID != "" {
+		addUnique(manager.alertIdx.byTrip[tripID])
+	}
+	if routeID != "" {
+		addUnique(manager.alertIdx.byRoute[routeID])
+	}
+	if agencyID != "" {
+		addUnique(manager.alertIdx.byAgency[agencyID])
 	}
 	return alerts
 }
@@ -182,22 +180,25 @@ func (manager *Manager) GetAlertsForTrip(ctx context.Context, tripID string) []g
 	return manager.GetAlertsByIDs(tripID, routeID, agencyID)
 }
 
+// GetAlertsForStop returns deduplicated alerts for the given stopID.
+// Deduplication by alert ID is done internally so callers never receive
+// duplicate entries even when the same alert ID appears in multiple feeds.
 func (manager *Manager) GetAlertsForStop(stopID string) []gtfs.Alert {
 	manager.realTimeMutex.RLock()
 	defer manager.realTimeMutex.RUnlock()
-
-	var alerts []gtfs.Alert
-	for _, alert := range manager.realTimeAlerts {
-		if alert.InformedEntities != nil {
-			for _, entity := range alert.InformedEntities {
-				if entity.StopID != nil && *entity.StopID == stopID {
-					alerts = append(alerts, alert)
-					break
-				}
-			}
+	src := manager.alertIdx.byStop[stopID]
+	if len(src) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(src))
+	out := make([]gtfs.Alert, 0, len(src))
+	for _, a := range src {
+		if _, ok := seen[a.ID]; !ok {
+			seen[a.ID] = struct{}{}
+			out = append(out, a)
 		}
 	}
-	return alerts
+	return out
 }
 
 // Fetches GTFS-RT data from a URL with per-feed headers.
@@ -239,7 +240,8 @@ func loadRealtimeData(ctx context.Context, source string, headers map[string]str
 
 // updateFeedRealtime fetches and processes realtime data for a single feed.
 // It updates the per-feed sub-maps and then calls rebuildMergedRealtimeLocked.
-func (manager *Manager) updateFeedRealtime(ctx context.Context, feedCfg RTFeedConfig) {
+// Returns true if new data was successfully fetched and processed.
+func (manager *Manager) updateFeedRealtime(ctx context.Context, feedCfg RTFeedConfig) bool {
 	logger := logging.FromContext(ctx).With(slog.String("component", "gtfs_realtime"))
 	feedID := feedCfg.ID
 
@@ -291,7 +293,22 @@ func (manager *Manager) updateFeedRealtime(ctx context.Context, feedCfg RTFeedCo
 
 	// Check for context cancellation
 	if ctx.Err() != nil {
-		return
+		return false
+	}
+
+	// Apply agency-based filtering if configured for this feed.
+	// This runs before acquiring realTimeMutex to keep the critical section short.
+	agencyFilter := manager.feedAgencyFilter[feedID]
+	if len(agencyFilter) > 0 {
+		if tripData != nil && tripErr == nil {
+			tripData.Trips = manager.filterTripsByAgency(tripData.Trips, agencyFilter)
+		}
+		if vehicleData != nil && vehicleErr == nil {
+			vehicleData.Vehicles = manager.filterVehiclesByAgency(vehicleData.Vehicles, agencyFilter)
+		}
+		if alertData != nil && alertErr == nil {
+			alertData.Alerts = manager.filterAlertsByAgency(alertData.Alerts, agencyFilter)
+		}
 	}
 
 	manager.realTimeMutex.Lock()
@@ -345,7 +362,13 @@ func (manager *Manager) updateFeedRealtime(ctx context.Context, feedCfg RTFeedCo
 
 				if prev, exists := prevByID[v.ID.ID]; exists {
 					if isVehicleStale(prev, v) {
-						// Keep newer existing vehicle, drop stale update
+						// Log and keep the newer existing vehicle, dropping the stale update
+						logging.LogOperation(logger, "skipping_stale_vehicle_entity",
+							slog.String("feed", feedID),
+							slog.String("vehicle_id", v.ID.ID),
+							slog.Time("existing_timestamp", *prev.Timestamp),
+							slog.Time("incoming_timestamp", *v.Timestamp),
+						)
 						validVehicles = append(validVehicles, prev)
 						continue
 					}
@@ -404,56 +427,188 @@ func (manager *Manager) updateFeedRealtime(ctx context.Context, feedCfg RTFeedCo
 	vehiclesUpdated := vehicleData != nil && vehicleErr == nil
 	alertsUpdated := alertData != nil && alertErr == nil
 
-	hadDataBefore := len(manager.feedTrips[feedID]) > 0 || len(manager.feedVehicles[feedID]) > 0 || len(manager.feedAlerts[feedID]) > 0
-	hasNewData := tripsUpdated || vehiclesUpdated || alertsUpdated
+	// OR logic: A feed is partially successful if ANY configured sub-feed succeeds.
+	hasNewData := false
+	hasURLs := false
 
-	if !hasNewData {
-		if hadDataBefore {
-			logger.Warn("all realtime feed sources failed - retaining stale data",
+	if feedCfg.TripUpdatesURL != "" {
+		hasURLs = true
+		if tripsUpdated {
+			hasNewData = true
+		}
+	}
+	if feedCfg.VehiclePositionsURL != "" {
+		hasURLs = true
+		if vehiclesUpdated {
+			hasNewData = true
+		}
+	}
+	if feedCfg.ServiceAlertsURL != "" {
+		hasURLs = true
+		if alertsUpdated {
+			hasNewData = true
+		}
+	}
+
+	if !hasURLs {
+		hasNewData = false
+	}
+
+	// Logging based on partial vs total success
+	if hasNewData {
+		fullSuccess := true
+		if feedCfg.TripUpdatesURL != "" && !tripsUpdated {
+			fullSuccess = false
+		}
+		if feedCfg.VehiclePositionsURL != "" && !vehiclesUpdated {
+			fullSuccess = false
+		}
+		if feedCfg.ServiceAlertsURL != "" && !alertsUpdated {
+			fullSuccess = false
+		}
+
+		if fullSuccess {
+			logger.Debug("updated realtime feed successfully",
 				slog.String("feed", feedID),
-				slog.Bool("trip_updates_error", tripErr != nil),
-				slog.Bool("vehicle_positions_error", vehicleErr != nil),
-				slog.Bool("service_alerts_error", alertErr != nil),
+				slog.Int("trips", len(manager.feedTrips[feedID])),
+				slog.Int("vehicles", len(manager.feedVehicles[feedID])),
+				slog.Int("alerts", len(manager.feedAlerts[feedID])),
 			)
 		} else {
-			logger.Error("all realtime feed sources failed - no data available",
+			logger.Warn("realtime feed partially updated",
 				slog.String("feed", feedID),
-				slog.Bool("trip_updates_error", tripErr != nil),
-				slog.Bool("vehicle_positions_error", vehicleErr != nil),
-				slog.Bool("service_alerts_error", alertErr != nil),
+				slog.Bool("trip_updates_configured", feedCfg.TripUpdatesURL != ""),
+				slog.Bool("trip_updates_success", tripsUpdated),
+				slog.Bool("vehicle_positions_configured", feedCfg.VehiclePositionsURL != ""),
+				slog.Bool("vehicle_positions_success", vehiclesUpdated),
+				slog.Bool("service_alerts_configured", feedCfg.ServiceAlertsURL != ""),
+				slog.Bool("service_alerts_success", alertsUpdated),
 			)
 		}
 	} else {
-		logger.Info("updated realtime feed",
+		logger.Error("realtime feed update failed",
 			slog.String("feed", feedID),
-			slog.Int("trips", len(manager.feedTrips[feedID])),
-			slog.Int("vehicles", len(manager.feedVehicles[feedID])),
-			slog.Int("alerts", len(manager.feedAlerts[feedID])),
+			slog.Bool("trip_updates_configured", feedCfg.TripUpdatesURL != ""),
+			slog.Bool("trip_updates_error", tripErr != nil),
+			slog.Bool("vehicle_positions_configured", feedCfg.VehiclePositionsURL != ""),
+			slog.Bool("vehicle_positions_error", vehicleErr != nil),
+			slog.Bool("service_alerts_configured", feedCfg.ServiceAlertsURL != ""),
+			slog.Bool("service_alerts_error", alertErr != nil),
 		)
 	}
 
 	manager.rebuildMergedRealtimeLocked()
+
+	// Update timestamp within the same lock
+	if hasNewData {
+		if manager.feedLastUpdate == nil {
+			manager.feedLastUpdate = make(map[string]time.Time)
+		}
+		manager.feedLastUpdate[feedID] = time.Now()
+	}
+
+	return hasNewData
+}
+
+// filterTripsByAgency returns only the trips whose route belongs to one of the
+// allowed agencies. Trips with an unresolvable route are dropped.
+func (manager *Manager) filterTripsByAgency(trips []gtfs.Trip, allowed map[string]bool) []gtfs.Trip {
+	ctx := context.TODO()
+
+	filtered := make([]gtfs.Trip, 0, len(trips))
+	for _, trip := range trips {
+		if trip.ID.RouteID == "" {
+			continue
+		}
+		if route, err := manager.GtfsDB.Queries.GetRoute(ctx, trip.ID.RouteID); err == nil {
+			if allowed[route.AgencyID] {
+				filtered = append(filtered, trip)
+			}
+		}
+	}
+	return filtered
+}
+
+// filterVehiclesByAgency returns only the vehicles whose trip's route belongs to
+// one of the allowed agencies. Vehicles without a trip or unresolvable route are dropped.
+func (manager *Manager) filterVehiclesByAgency(vehicles []gtfs.Vehicle, allowed map[string]bool) []gtfs.Vehicle {
+	ctx := context.TODO()
+
+	filtered := make([]gtfs.Vehicle, 0, len(vehicles))
+	for _, v := range vehicles {
+		if v.Trip == nil || v.Trip.ID.RouteID == "" {
+			continue
+		}
+		if route, err := manager.GtfsDB.Queries.GetRoute(ctx, v.Trip.ID.RouteID); err == nil {
+			if allowed[route.AgencyID] {
+				filtered = append(filtered, v)
+			}
+		}
+	}
+	return filtered
+}
+
+// filterAlertsByAgency returns only alerts referencing an allowed agency.
+func (manager *Manager) filterAlertsByAgency(alerts []gtfs.Alert, allowed map[string]bool) []gtfs.Alert {
+	ctx := context.TODO()
+
+	filtered := make([]gtfs.Alert, 0, len(alerts))
+	for _, alert := range alerts {
+		if alertMatchesAgency(ctx, manager, alert, allowed) {
+			filtered = append(filtered, alert)
+		}
+	}
+	return filtered
+}
+
+func alertMatchesAgency(ctx context.Context, manager *Manager, alert gtfs.Alert, allowed map[string]bool) bool {
+	// NOTE: stop-only InformedEntities are not resolved to agencies.
+	// Alerts referencing only stop IDs will be dropped when agency filtering is active.
+	for _, entity := range alert.InformedEntities {
+		if entity.AgencyID != nil && allowed[*entity.AgencyID] {
+			return true
+		}
+		if entity.RouteID != nil && *entity.RouteID != "" {
+			if route, err := manager.GtfsDB.Queries.GetRoute(ctx, *entity.RouteID); err == nil {
+				if allowed[route.AgencyID] {
+					return true
+				}
+			}
+		}
+		if entity.TripID != nil && entity.TripID.RouteID != "" {
+			if route, err := manager.GtfsDB.Queries.GetRoute(ctx, entity.TripID.RouteID); err == nil {
+				if allowed[route.AgencyID] {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (manager *Manager) rebuildMergedRealtimeLocked() {
 	feedIDs := make([]string, 0, len(manager.feedTrips))
-	for id := range manager.feedTrips {
+	totalTrips := 0
+	for id, trips := range manager.feedTrips {
 		feedIDs = append(feedIDs, id)
+		totalTrips += len(trips)
 	}
-	sort.Strings(feedIDs)
+	slices.Sort(feedIDs)
 
-	var allTrips []gtfs.Trip
+	allTrips := make([]gtfs.Trip, 0, totalTrips)
 	for _, id := range feedIDs {
 		allTrips = append(allTrips, manager.feedTrips[id]...)
 	}
 
 	vehicleFeedIDs := make([]string, 0, len(manager.feedVehicles))
-	for id := range manager.feedVehicles {
+	totalVehicles := 0
+	for id, vehicles := range manager.feedVehicles {
 		vehicleFeedIDs = append(vehicleFeedIDs, id)
+		totalVehicles += len(vehicles)
 	}
-	sort.Strings(vehicleFeedIDs)
+	slices.Sort(vehicleFeedIDs)
 
-	var allVehicles []gtfs.Vehicle
+	allVehicles := make([]gtfs.Vehicle, 0, totalVehicles)
 	for _, id := range vehicleFeedIDs {
 		allVehicles = append(allVehicles, manager.feedVehicles[id]...)
 	}
@@ -462,12 +617,7 @@ func (manager *Manager) rebuildMergedRealtimeLocked() {
 	for id := range manager.feedAlerts {
 		alertFeedIDs = append(alertFeedIDs, id)
 	}
-	sort.Strings(alertFeedIDs)
-
-	var allAlerts []gtfs.Alert
-	for _, id := range alertFeedIDs {
-		allAlerts = append(allAlerts, manager.feedAlerts[id]...)
-	}
+	slices.Sort(alertFeedIDs)
 
 	tripLookup := make(map[string]int, len(allTrips))
 	for i, trip := range allTrips {
@@ -478,6 +628,7 @@ func (manager *Manager) rebuildMergedRealtimeLocked() {
 
 	vehicleLookupByTrip := make(map[string]int, len(allVehicles))
 	vehicleLookupByVehicle := make(map[string]int, len(allVehicles))
+	duplicatedVehicleByRoute := make(map[string][]gtfs.Vehicle)
 	for i, vehicle := range allVehicles {
 		if vehicle.Trip != nil && vehicle.Trip.ID.ID != "" {
 			vehicleLookupByTrip[vehicle.Trip.ID.ID] = i
@@ -485,18 +636,98 @@ func (manager *Manager) rebuildMergedRealtimeLocked() {
 		if vehicle.ID != nil && vehicle.ID.ID != "" {
 			vehicleLookupByVehicle[vehicle.ID.ID] = i
 		}
+		if vehicle.Trip == nil || vehicle.Trip.ID.ScheduleRelationship != gtfsrt.TripDescriptor_DUPLICATED {
+			continue
+		}
+		routeID := vehicle.Trip.ID.RouteID
+		// Some feeds omit route_id in VehiclePosition trip descriptors.
+		// Fall back to the corresponding TripUpdate to resolve the route.
+		if routeID == "" && vehicle.Trip.ID.ID != "" {
+			if index, exists := tripLookup[vehicle.Trip.ID.ID]; exists {
+				routeID = allTrips[index].ID.RouteID
+			}
+		}
+		if routeID != "" {
+			duplicatedVehicleByRoute[routeID] = append(duplicatedVehicleByRoute[routeID], vehicle)
+		}
+	}
+	idx := alertIndex{
+		byTrip:   make(map[string][]gtfs.Alert),
+		byRoute:  make(map[string][]gtfs.Alert),
+		byAgency: make(map[string][]gtfs.Alert),
+		byStop:   make(map[string][]gtfs.Alert),
+	}
+	for _, id := range alertFeedIDs {
+		for _, alert := range manager.feedAlerts[id] {
+			if alert.InformedEntities == nil || alert.ID == "" {
+				continue
+			}
+			// Per-alert per-bucket dedup: prevents the same alert from being appended
+			// to the same bucket more than once when it has multiple InformedEntities
+			// referencing the same key (e.g. two entities both pointing to stop "S1").
+			// Capacity is set to the entity count so the map never needs to grow.
+			n := len(alert.InformedEntities)
+			seenTrip := make(map[string]bool, n)
+			seenRoute := make(map[string]bool, n)
+			seenAgency := make(map[string]bool, n)
+			seenStop := make(map[string]bool, n)
+			for _, entity := range alert.InformedEntities {
+				if entity.TripID != nil && !seenTrip[entity.TripID.ID] {
+					seenTrip[entity.TripID.ID] = true
+					idx.byTrip[entity.TripID.ID] = append(idx.byTrip[entity.TripID.ID], alert)
+				}
+				// Only match route-level entities that have no stop or trip restriction.
+				// Entities with {routeId + stopId} are stop-specific alerts and are filed
+				// in byStop only (matching Java's inverted index bucket behaviour).
+				if entity.RouteID != nil && entity.StopID == nil && entity.TripID == nil && !seenRoute[*entity.RouteID] {
+					seenRoute[*entity.RouteID] = true
+					idx.byRoute[*entity.RouteID] = append(idx.byRoute[*entity.RouteID], alert)
+				}
+				// Only match agency-wide alerts: entity has agencyId but no route or trip restriction.
+				if entity.AgencyID != nil && entity.RouteID == nil && entity.TripID == nil && !seenAgency[*entity.AgencyID] {
+					seenAgency[*entity.AgencyID] = true
+					idx.byAgency[*entity.AgencyID] = append(idx.byAgency[*entity.AgencyID], alert)
+				}
+				if entity.StopID != nil && !seenStop[*entity.StopID] {
+					seenStop[*entity.StopID] = true
+					idx.byStop[*entity.StopID] = append(idx.byStop[*entity.StopID], alert)
+				}
+			}
+		}
 	}
 
 	manager.realTimeTrips = allTrips
 	manager.realTimeVehicles = allVehicles
-	manager.realTimeAlerts = allAlerts
 	manager.realTimeTripLookup = tripLookup
 	manager.realTimeVehicleLookupByTrip = vehicleLookupByTrip
 	manager.realTimeVehicleLookupByVehicle = vehicleLookupByVehicle
+	manager.duplicatedVehicleByRoute = duplicatedVehicleByRoute
+	manager.alertIdx = idx
+}
+
+// calculateBackoff computes the next polling interval using exponential backoff with jitter
+func calculateBackoff(baseInterval time.Duration, consecutiveErrors int, maxInterval time.Duration) time.Duration {
+	// Cap the consecutive errors at 5 to prevent the multiplier from exceeding 32x
+	// We use an if-statement here because a package-level float64 min() shadows the Go built-in min()
+	exponent := consecutiveErrors
+	if exponent > 5 {
+		exponent = 5
+	}
+
+	// Exponential scale: 2, 4, 8, 16, 32
+	backoffMultiplier := 1 << exponent
+	nextInterval := time.Duration(float64(baseInterval) * float64(backoffMultiplier))
+	if nextInterval > maxInterval {
+		nextInterval = maxInterval
+	}
+
+	// +/- 10% Jitter prevents thundering herd behavior across failing feeds
+	jitter := time.Duration((rand.Float64() - 0.5) * 0.2 * float64(nextInterval))
+	return nextInterval + jitter
 }
 
 // pollFeed runs the polling loop for a single feed. Each feed gets its own
-// goroutine with its own ticker at the feed's configured refresh interval.
+// goroutine with exponential backoff on errors, reporting to prometheus metrics.
 func (manager *Manager) pollFeed(feedCfg RTFeedConfig) {
 	defer manager.wg.Done()
 
@@ -505,17 +736,25 @@ func (manager *Manager) pollFeed(feedCfg RTFeedConfig) {
 	}
 
 	logger := slog.Default().With(slog.String("component", "gtfs_realtime_updater"))
-	interval := time.Duration(feedCfg.RefreshInterval) * time.Second
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	baseInterval := time.Duration(feedCfg.RefreshInterval) * time.Second
+	maxInterval := 5 * time.Minute
+
+	consecutiveErrors := 0
+	// Initialize to time.Now() to grant a 5-minute startup grace period before triggering staleness clearing
+	lastSuccessfulFetch := time.Now()
+	feedCleared := false // Track if data has already been cleared for this failure cycle
 
 	logging.LogOperation(logger, "started_realtime_feed_poller",
 		slog.String("feed", feedCfg.ID),
-		slog.Duration("interval", interval),
+		slog.Duration("interval", baseInterval),
 		slog.String("tripUpdatesURL", feedCfg.TripUpdatesURL),
 		slog.String("vehiclePositionsURL", feedCfg.VehiclePositionsURL),
 		slog.String("serviceAlertsURL", feedCfg.ServiceAlertsURL),
 	)
+
+	// Use a Timer instead of Ticker to dynamically control intervals (backoff/jitter)
+	timer := time.NewTimer(baseInterval) // Wait one interval before first poll (prevent double fetch)
+	defer timer.Stop()
 
 	for {
 		select {
@@ -523,16 +762,69 @@ func (manager *Manager) pollFeed(feedCfg RTFeedConfig) {
 			logging.LogOperation(logger, "shutting_down_realtime_feed_poller",
 				slog.String("feed", feedCfg.ID))
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			func() {
+				start := time.Now()
+
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
 				ctx = logging.WithLogger(ctx, logger)
 
 				logging.LogOperation(logger, "updating_gtfs_realtime_data",
 					slog.String("feed", feedCfg.ID))
-				manager.updateFeedRealtime(ctx, feedCfg)
+
+				hasNewData := manager.updateFeedRealtime(ctx, feedCfg)
+				duration := time.Since(start)
+
+				if manager.Metrics != nil {
+					manager.Metrics.FeedFetchDuration.WithLabelValues(feedCfg.ID).Observe(duration.Seconds())
+				}
+
+				if hasNewData {
+					consecutiveErrors = 0
+					lastSuccessfulFetch = time.Now()
+					feedCleared = false // Reset clearing flag on success
+
+					if manager.Metrics != nil {
+						manager.Metrics.FeedLastSuccessfulFetchTime.WithLabelValues(feedCfg.ID).Set(float64(lastSuccessfulFetch.Unix()))
+						manager.Metrics.FeedConsecutiveErrors.WithLabelValues(feedCfg.ID).Set(0)
+					}
+
+					timer.Reset(baseInterval) // Reset to standard interval on success
+				} else {
+					consecutiveErrors++
+
+					if manager.Metrics != nil {
+						manager.Metrics.FeedConsecutiveErrors.WithLabelValues(feedCfg.ID).Set(float64(consecutiveErrors))
+					}
+
+					// Circuit Breaker / Staleness Protection
+					if time.Since(lastSuccessfulFetch) > staleFeedThreshold {
+						if !feedCleared { // Only clear once per extended outage
+							logger.Warn("feed data is stale due to consecutive failures, clearing",
+								slog.String("feed", feedCfg.ID),
+								slog.Duration("staleness", time.Since(lastSuccessfulFetch)))
+							manager.clearFeedData(feedCfg.ID)
+							feedCleared = true
+						}
+					}
+
+					// Use extracted, testable backoff function
+					nextInterval := calculateBackoff(baseInterval, consecutiveErrors, maxInterval)
+
+					logger.Warn("feed update failed, applying backoff",
+						slog.String("feed", feedCfg.ID),
+						slog.Int("consecutive_errors", consecutiveErrors),
+						slog.Duration("next_interval", nextInterval))
+
+					timer.Reset(nextInterval)
+				}
 			}()
 		}
 	}
+}
+
+// GetAlertsForRoute returns alerts matching the given route ID.
+func (manager *Manager) GetAlertsForRoute(routeID string) []gtfs.Alert {
+	return manager.GetAlertsByIDs("", routeID, "")
 }

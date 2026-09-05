@@ -7,20 +7,23 @@ import (
 	"maglev.onebusaway.org/internal/utils"
 )
 
+// routeIDsForAgencyHandler returns a list of route IDs belonging to a given agency.
 func (api *RestAPI) routeIDsForAgencyHandler(w http.ResponseWriter, r *http.Request) {
-	id, _ := utils.GetIDFromContext(r.Context())
-
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
-	agency := api.GtfsManager.FindAgency(id)
-
-	if agency == nil {
-		api.sendNull(w, r)
+	id, ok := api.extractAndValidateID(w, r)
+	if !ok {
 		return
 	}
 
 	ctx := r.Context()
+	agency, err := api.GtfsManager.FindAgency(ctx, id)
+	if err != nil {
+		api.serverErrorResponse(w, r, err)
+		return
+	}
+	if agency == nil {
+		api.sendNotFound(w, r)
+		return
+	}
 
 	routeIDs, err := api.GtfsManager.GtfsDB.Queries.GetRouteIDsForAgency(ctx, id)
 
@@ -34,5 +37,5 @@ func (api *RestAPI) routeIDsForAgencyHandler(w http.ResponseWriter, r *http.Requ
 		response = append(response, utils.FormCombinedID(id, routeID))
 	}
 
-	api.sendResponse(w, r, models.NewListResponse(response, models.NewEmptyReferences(), false, api.Clock))
+	api.sendResponse(w, r, models.NewListResponse(response, *models.NewEmptyReferences(), false, api.Clock))
 }

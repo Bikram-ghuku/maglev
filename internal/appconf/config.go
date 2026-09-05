@@ -7,12 +7,16 @@ package appconf
 // configuration settings from command-line flags when the Application starts.
 type Config struct {
 	Port             int
+	Host             string
 	Env              Environment
 	ApiKeys          []string
 	ProtectedApiKeys []string
 	ExemptApiKeys    []string
-	Verbose          bool
-	RateLimit        int // Requests per second per API key for rate limiting
+	RateLimit        int // Requests per second across the entire service (global shared bucket; exempt keys bypass it)
+	LogLevel         string
+	LogFormat        string
+	TLSCertPath      string
+	TLSKeyPath       string
 }
 
 // Environment is an enumerated type representing various stages or configurations in the system's lifecycle.

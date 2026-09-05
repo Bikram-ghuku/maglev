@@ -12,6 +12,11 @@
       "minimum": 1,
       "maximum": 65535
     },
+    "host": {
+    "type": "string",
+    "description": "The address to bind the server to. Defaults to all interfaces when empty.",
+    "default": ""
+    },
     "env": {
       "type": "string",
       "description": "Environment (development|test|production)",
@@ -28,6 +33,18 @@
       "default": ["test"],
       "uniqueItems": true,
       "minItems": 1
+    },
+    "log-level": {
+      "type": "string",
+      "description": "Log Level (debug|info|warn|error)",
+      "enum": ["debug", "info", "warn", "error"],
+      "default": "info"
+    },
+    "log-format": {
+      "type": "string",
+      "description": "Format of logging output (text|json)",
+      "enum": ["text", "json"],
+      "default": "text"
     },
     "protected-api-keys": {
       "type": "array",
@@ -159,12 +176,25 @@
       "type": "string",
       "description": "Path to the SQLite database containing GTFS data (cannot contain '..' for security)",
       "default": "./gtfs.db"
+    },
+    "tls-cert-path": {
+      "type": "string",
+      "description": "Path to TLS certificate file. When set together with tls-key-path, the server serves HTTPS."
+    },
+    "tls-key-path": {
+      "type": "string",
+      "description": "Path to TLS private key file. When set together with tls-cert-path, the server serves HTTPS."
     }
+  },
+  "dependencies": {
+    "tls-cert-path": ["tls-key-path"],
+    "tls-key-path": ["tls-cert-path"]
   },
   "additionalProperties": false,
   "examples": [
     {
       "port": 8080,
+      "host": "127.0.0.1",
       "env": "production",
       "api-keys": ["key1", "key2", "key3"],
       "protected-api-keys": ["secret1", "secret2"],

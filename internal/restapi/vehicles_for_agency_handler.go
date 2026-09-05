@@ -2,33 +2,76 @@ package restapi
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"maglev.onebusaway.org/gtfsdb"
 	"maglev.onebusaway.org/internal/models"
+	"maglev.onebusaway.org/internal/nulls"
 	"maglev.onebusaway.org/internal/utils"
 )
 
+// vehiclesForAgencyHandler returns real-time vehicle positions for all vehicles operated by a given agency.
 func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Request) {
-	id, _ := utils.GetIDFromContext(r.Context())
-
-	ctx := r.Context()
-
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
-	agency := api.GtfsManager.FindAgency(id)
-	if agency == nil {
-		// return an empty list response.
-		api.sendResponse(w, r, models.NewListResponse([]interface{}{}, models.ReferencesModel{}, false, api.Clock))
+	id, ok := api.extractAndValidateID(w, r)
+	if !ok {
 		return
 	}
 
-	vehiclesForAgency := api.GtfsManager.VehiclesForAgencyID(id)
+	ctx := r.Context()
 
-	// Apply pagination
-	offset, limit := utils.ParsePaginationParams(r)
-	vehiclesForAgency, limitExceeded := utils.PaginateSlice(vehiclesForAgency, offset, limit)
+	agency, err := api.GtfsManager.FindAgency(ctx, id)
+	if err != nil {
+		api.serverErrorResponse(w, r, err)
+		return
+	}
+
+	if agency == nil {
+		// Unknown/untracked agency: empty list, outOfRange=false.
+		api.sendResponse(w, r, models.NewListResponseWithRange([]any{}, *models.NewEmptyReferences(), false, api.Clock, false))
+		return
+	}
+
+	// Parse requested reference time for status entries, falling back to server clock if absent.
+	loc, err := loadAgencyLocation(agency.ID, agency.Timezone)
+	if err != nil {
+		api.serverErrorResponse(w, r, err)
+		return
+	}
+	referenceTime := api.Clock.Now().In(loc)
+	if timeParam := r.URL.Query().Get("time"); timeParam != "" {
+		_, parsedTime, fieldErrors, ok := utils.ParseTimeParameter(timeParam, loc, api.Clock)
+		if !ok {
+			api.validationErrorResponse(w, r, fieldErrors)
+			return
+		}
+		referenceTime = parsedTime
+	}
+
+	// Service date is midnight of the reference date in the agency timezone.
+	serviceDate := models.NewModelTime(utils.CalculateServiceDate(referenceTime))
+
+	vehiclesForAgency, err := api.GtfsManager.VehiclesForAgencyID(ctx, id)
+	if err != nil {
+		api.serverErrorResponse(w, r, err)
+		return
+	}
+
+	// ageInSeconds: absent = no filter; any value >= 0 applies a strict cutoff.
+	const maxAgeInSeconds = int64((1<<63 - 1) / int64(time.Second))
+	if val := r.URL.Query().Get("ageInSeconds"); val != "" {
+		if ageInSeconds, err := strconv.ParseInt(val, 10, 64); err == nil && ageInSeconds >= 0 && ageInSeconds <= maxAgeInSeconds {
+			cutoff := referenceTime.Add(-time.Duration(ageInSeconds) * time.Second)
+			filtered := vehiclesForAgency[:0]
+			for _, vehicle := range vehiclesForAgency {
+				if !api.GtfsManager.GetVehicleLastUpdateTime(&vehicle).Before(cutoff) {
+					filtered = append(filtered, vehicle)
+				}
+			}
+			vehiclesForAgency = filtered
+		}
+	}
+
 	vehiclesList := make([]models.VehicleStatus, 0, len(vehiclesForAgency))
 
 	// Collect unique route IDs and batch-fetch routes
@@ -39,8 +82,8 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	routeIDs := make([]string, 0, len(routeIDSet))
-	for id := range routeIDSet {
-		routeIDs = append(routeIDs, id)
+	for routeID := range routeIDSet {
+		routeIDs = append(routeIDs, routeID)
 	}
 	routes, err := api.GtfsManager.GtfsDB.Queries.GetRoutesByIDs(ctx, routeIDs)
 	if err != nil {
@@ -48,28 +91,34 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	routeByID := make(map[string]gtfsdb.Route, len(routes))
-	for _, r := range routes {
-		routeByID[r.ID] = r
+	for _, route := range routes {
+		routeByID[route.ID] = route
 	}
 
 	// Maps to build references
-	agencyRefs := make(map[string]models.AgencyReference)
 	routeRefs := make(map[string]models.Route)
-	tripRefs := make(map[string]interface{})
+	tripRefs := make(map[string]models.Trip)
 
 	for _, vehicle := range vehiclesForAgency {
 		if ctx.Err() != nil {
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 
+		if vehicle.ID == nil {
+			api.Logger.Warn("skipping vehicle with nil ID descriptor", "agencyID", id)
+			continue
+		}
+		vid := vehicle.ID.ID
 		vehicleStatus := models.VehicleStatus{
-			VehicleID: vehicle.ID.ID,
+			VehicleID: vid,
 		}
 
-		// Set timestamps
+		// Update times default to 0 when no real update exists.
 		if vehicle.Timestamp != nil {
-			vehicleStatus.LastLocationUpdateTime = vehicle.Timestamp.UnixNano() / int64(time.Millisecond)
-			vehicleStatus.LastUpdateTime = vehicle.Timestamp.UnixNano() / int64(time.Millisecond)
+			ts := models.NewModelTime(*vehicle.Timestamp)
+			vehicleStatus.LastLocationUpdateTime = ts
+			vehicleStatus.LastUpdateTime = ts
 		}
 
 		// Set location if available
@@ -85,13 +134,21 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 
 		// Build trip status if trip is available
 		if vehicle.Trip != nil {
-			tripStatus := &models.TripStatus{
-				ActiveTripID:      vehicle.Trip.ID.ID,
-				BlockTripSequence: 0,
-				Scheduled:         true,
-				Phase:             vehicleStatus.Phase,
-				Status:            vehicleStatus.Status,
+			vehicleStatus.TripID = utils.FormCombinedID(id, vehicle.Trip.ID.ID)
+
+			tripStatus := models.NewTripStatus()
+			// Resolve the executing trip; may differ from the nominal trip when interlining.
+			activeTripID := api.resolveActiveTripID(ctx, vehicle.Trip.ID.ID, referenceTime)
+			tripStatus.ActiveTripID = utils.FormCombinedID(id, activeTripID)
+			// Resolve the block trip sequence for the active (not nominal) trip,
+			// so it reflects the position of the trip actually being executed.
+			if seq, ok := api.blockTripSequence(ctx, activeTripID, referenceTime); ok {
+				tripStatus.BlockTripSequence = seq
+			} else {
+				tripStatus.BlockTripSequence = -1
 			}
+			tripStatus.Phase = vehicleStatus.Phase
+			tripStatus.Status = vehicleStatus.Status
 
 			// Add position information to trip status
 			if vehicle.Position != nil && vehicle.Position.Latitude != nil && vehicle.Position.Longitude != nil {
@@ -109,90 +166,109 @@ func (api *RestAPI) vehiclesForAgencyHandler(w http.ResponseWriter, r *http.Requ
 				if obaOrientation < 0 {
 					obaOrientation += 360
 				}
-				tripStatus.Orientation = float32(obaOrientation)
+				tripStatus.Orientation = float64(obaOrientation)
 			}
 
-			// Set service date (use current date for now)
-			tripStatus.ServiceDate = api.Clock.NowUnixMilli()
+			// Trip status update times default to 0 when no real update exists.
+			if vehicle.Timestamp != nil {
+				ts := models.NewModelTime(*vehicle.Timestamp)
+				tripStatus.LastUpdateTime = ts
+				tripStatus.LastLocationUpdateTime = ts
+			}
+
+			tripStatus.ServiceDate = serviceDate
+
+			// Propagate occupancy status from GTFS-RT to both TripStatus and VehicleStatus.
+			// There is no source for occupancyCapacity or occupancyCount anywhere in maglev — not in the SQLite DB,
+			// not in GTFS-RT. Those fields will remain omitted.
+			if vehicle.OccupancyStatus != nil {
+				occupancy := vehicle.OccupancyStatus.String()
+				tripStatus.OccupancyStatus = occupancy
+				vehicleStatus.OccupancyStatus = occupancy
+			}
 
 			vehicleStatus.TripStatus = tripStatus
 
 			// Add trip to references (basic trip reference)
-			tripRefs[vehicle.Trip.ID.ID] = map[string]interface{}{
-				"id":      vehicle.Trip.ID.ID,
-				"routeId": vehicle.Trip.ID.RouteID,
+			tripRefs[vehicle.Trip.ID.ID] = models.Trip{
+				ID:      utils.FormCombinedID(id, vehicle.Trip.ID.ID),
+				RouteID: utils.FormCombinedID(id, vehicle.Trip.ID.RouteID),
 			}
 
-			// Add route to references (from batch-fetched map)
+			// Add the nominal trip's route to references (from batch-fetched map).
 			if route, ok := routeByID[vehicle.Trip.ID.RouteID]; ok {
-				shortName := ""
-				if route.ShortName.Valid {
-					shortName = route.ShortName.String
-				}
-				longName := ""
-				if route.LongName.Valid {
-					longName = route.LongName.String
-				}
-				desc := ""
-				if route.Desc.Valid {
-					desc = route.Desc.String
-				}
-				url := ""
-				if route.Url.Valid {
-					url = route.Url.String
-				}
-				color := ""
-				if route.Color.Valid {
-					color = route.Color.String
-				}
-				textColor := ""
-				if route.TextColor.Valid {
-					textColor = route.TextColor.String
-				}
-
-				routeRefs[route.ID] = models.NewRoute(
-					route.ID, route.AgencyID, shortName, longName,
-					desc, models.RouteType(route.Type),
-					url, color, textColor)
-
+				addRouteReference(routeRefs, route)
 			}
+
+			// For interlining, also add the active trip and its route to references.
+			if activeTripID != vehicle.Trip.ID.ID {
+				if activeTrip, err := api.GtfsManager.GtfsDB.Queries.GetTrip(ctx, activeTripID); err == nil {
+					tripRefs[activeTripID] = models.Trip{
+						ID:      utils.FormCombinedID(id, activeTripID),
+						RouteID: utils.FormCombinedID(id, activeTrip.RouteID),
+					}
+					activeRoute, ok := routeByID[activeTrip.RouteID]
+					if !ok {
+						if fetched, err := api.GtfsManager.GtfsDB.Queries.GetRoute(ctx, activeTrip.RouteID); err == nil {
+							activeRoute, ok = fetched, true
+						}
+					}
+					if ok {
+						addRouteReference(routeRefs, activeRoute)
+					}
+				}
+			}
+		} else {
+			defaultTripStatus := models.NewTripStatus()
+			defaultTripStatus.Status = "default"
+			defaultTripStatus.Phase = "scheduled"
+			vehicleStatus.TripStatus = defaultTripStatus
 		}
 
 		vehiclesList = append(vehiclesList, vehicleStatus)
 	}
 
-	// Add agency to references
-	agencyRefs[agency.Id] = models.NewAgencyReference(
-		agency.Id, agency.Name, agency.Url, agency.Timezone,
-		agency.Language, agency.Phone, agency.Email,
-		agency.FareUrl, "", false,
-	)
-
 	// Convert maps to slices for references
-	agencyRefList := make([]models.AgencyReference, 0, len(agencyRefs))
-	for _, agencyRef := range agencyRefs {
-		agencyRefList = append(agencyRefList, agencyRef)
-	}
-
-	routeRefList := make([]interface{}, 0, len(routeRefs))
+	routeRefList := make([]models.Route, 0, len(routeRefs))
 	for _, routeRef := range routeRefs {
 		routeRefList = append(routeRefList, routeRef)
 	}
 
-	tripRefList := make([]interface{}, 0, len(tripRefs))
+	tripRefList := make([]models.Trip, 0, len(tripRefs))
 	for _, tripRef := range tripRefs {
 		tripRefList = append(tripRefList, tripRef)
 	}
 
-	references := models.ReferencesModel{
-		Agencies:   agencyRefList,
-		Routes:     routeRefList,
-		Situations: []interface{}{},
-		StopTimes:  []interface{}{},
-		Stops:      []models.Stop{},
-		Trips:      tripRefList,
+	// Omit references entirely when includeReferences=false.
+	references := models.NewEmptyReferences()
+	if ShouldIncludeReferences(r) {
+		references.Agencies = []models.AgencyReference{models.AgencyReferenceFromDatabase(agency)}
+		references.Routes = routeRefList
+		references.Trips = tripRefList
+
+		alerts := deduplicateAlerts(
+			api.collectAlertsForRoutes(routeIDs),
+			api.GtfsManager.GetAlertsByIDs("", "", id),
+		)
+		references.Situations = append(references.Situations, api.BuildSituationReferences(alerts)...)
 	}
 
-	response := models.NewListResponse(vehiclesList, references, limitExceeded, api.Clock)
+	// Spec: this endpoint returns all matching vehicles, so limitExceeded is always false.
+	response := models.NewListResponse(vehiclesList, *references, false, api.Clock)
 	api.sendResponse(w, r, response)
+}
+
+// addRouteReference inserts a route reference keyed by its combined agencyID_routeID.
+func addRouteReference(routeRefs map[string]models.Route, route gtfsdb.Route) {
+	combinedRouteID := utils.FormCombinedID(route.AgencyID, route.ID)
+	routeRefs[combinedRouteID] = models.NewRoute(
+		combinedRouteID, route.AgencyID,
+		nulls.StringOrEmpty(route.ShortName),
+		nulls.StringOrEmpty(route.LongName),
+		nulls.StringOrEmpty(route.Desc),
+		models.RouteType(route.Type),
+		nulls.StringOrEmpty(route.Url),
+		nulls.StringOrEmpty(route.Color),
+		nulls.StringOrEmpty(route.TextColor),
+	)
 }

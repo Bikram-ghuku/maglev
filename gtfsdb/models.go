@@ -19,6 +19,17 @@ type Agency struct {
 	Email    sql.NullString
 }
 
+type BlockLayover struct {
+	ID            int64
+	BlockID       string
+	ServiceID     string
+	RouteID       string
+	LayoverStopID string
+	LayoverStart  int64
+	LayoverEnd    int64
+	NextTripID    string
+}
+
 type BlockTripEntry struct {
 	ID                int64
 	BlockTripIndexID  int64
@@ -55,11 +66,20 @@ type CalendarDate struct {
 	ExceptionType int64
 }
 
+type Frequency struct {
+	TripID      string
+	StartTime   int64
+	EndTime     int64
+	HeadwaySecs int64
+	ExactTimes  int64
+}
+
 type ImportMetadatum struct {
-	ID         int64
-	FileHash   string
-	ImportTime int64
-	FileSource string
+	ID            int64
+	FileHash      string
+	ImportTime    int64
+	FileSource    string
+	FeedExpiresAt sql.NullInt64
 }
 
 type ProblemReportsStop struct {
@@ -139,6 +159,11 @@ type Stop struct {
 	ParentStation      sql.NullString
 }
 
+type StopAgency struct {
+	StopID   string
+	AgencyID string
+}
+
 type StopTime struct {
 	TripID            string
 	ArrivalTime       int64
@@ -183,4 +208,6 @@ type Trip struct {
 	ShapeID              sql.NullString
 	WheelchairAccessible sql.NullInt64
 	BikesAllowed         sql.NullInt64
+	MinArrivalTime       sql.NullInt64
+	MaxDepartureTime     sql.NullInt64
 }

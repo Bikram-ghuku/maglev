@@ -1,26 +1,32 @@
 package restapi
 
 import (
+	"cmp"
 	"context"
-	"database/sql"
 	"net/http"
-	"sort"
+	"slices"
+	"strconv"
+	"time"
 
 	"maglev.onebusaway.org/gtfsdb"
 	"maglev.onebusaway.org/internal/models"
+	"maglev.onebusaway.org/internal/nulls"
 	"maglev.onebusaway.org/internal/utils"
 )
 
+// blockHandler returns the block configuration for a given block ID, including
+// the ordered sequence of trips and their stop times within the block.
 func (api *RestAPI) blockHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if ctx.Err() != nil {
-		api.serverErrorResponse(w, r, ctx.Err())
+		api.clientCanceledResponse(w, r, ctx.Err())
 		return
 	}
 
-	parsed, _ := utils.GetParsedIDFromContext(r.Context())
-	agencyID := parsed.AgencyID
-	blockID := parsed.CodeID
+	agencyID, blockID, ok := api.extractAndValidateAgencyCodeID(w, r)
+	if !ok {
+		return
+	}
 
 	//  Return JSON 400 response for invalid block IDs
 	// We use an explicit struct here to ensure the text is exactly "invalid block id"
@@ -29,13 +35,10 @@ func (api *RestAPI) blockHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	api.GtfsManager.RLock()
-	defer api.GtfsManager.RUnlock()
-
-	block, err := api.GtfsManager.GtfsDB.Queries.GetBlockDetails(ctx, sql.NullString{String: blockID, Valid: true})
+	block, err := api.GtfsManager.GtfsDB.Queries.GetBlockDetails(ctx, nulls.String(blockID))
 	if err != nil {
 		if ctx.Err() != nil {
-			api.serverErrorResponse(w, r, ctx.Err())
+			api.clientCanceledResponse(w, r, ctx.Err())
 			return
 		}
 		api.sendNotFound(w, r)
@@ -48,20 +51,15 @@ func (api *RestAPI) blockHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blockData := models.BlockData{
-		Entry: transformBlockToEntry(block, utils.FormCombinedID(agencyID, blockID), agencyID),
-	}
-
-	blockResponse := models.BlockResponse{
-		Data: blockData,
-	}
+	blockEntry := transformBlockToEntry(block, utils.FormCombinedID(agencyID, blockID), agencyID)
 
 	references, err := api.getReferences(ctx, agencyID, block)
 	if err != nil {
 		api.serverErrorResponse(w, r, err)
 		return
 	}
-	response := models.NewEntryResponse(blockResponse, references, api.Clock)
+
+	response := models.NewEntryResponse(blockEntry, references, api.Clock)
 	api.sendResponse(w, r, response)
 }
 
@@ -76,7 +74,7 @@ func transformBlockToEntry(block []gtfsdb.GetBlockDetailsRow, blockID, agencyID 
 	for serviceID := range serviceGroups {
 		serviceIDs = append(serviceIDs, serviceID)
 	}
-	sort.Strings(serviceIDs)
+	slices.Sort(serviceIDs)
 
 	configurations := make([]models.BlockConfiguration, 0, len(serviceGroups))
 
@@ -100,13 +98,13 @@ func transformBlockToEntry(block []gtfsdb.GetBlockDetailsRow, blockID, agencyID 
 		for tripID := range tripStops {
 			tripIDs = append(tripIDs, tripID)
 		}
-		sort.Strings(tripIDs)
+		slices.Sort(tripIDs)
 
 		for _, tripID := range tripIDs {
 			stops := tripStops[tripID]
 
-			sort.Slice(stops, func(i, j int) bool {
-				return stops[i].StopSequence < stops[j].StopSequence
+			slices.SortFunc(stops, func(a, b gtfsdb.GetBlockDetailsRow) int {
+				return cmp.Compare(a.StopSequence, b.StopSequence)
 			})
 
 			var blockStopTimes []models.BlockStopTime
@@ -126,12 +124,14 @@ func transformBlockToEntry(block []gtfsdb.GetBlockDetailsRow, blockID, agencyID 
 				blockStopTime := models.BlockStopTime{
 					BlockSequence:      int(stop.StopSequence - 1),
 					DistanceAlongBlock: blockDistance,
-					StopTime: models.StopTime{
-						ArrivalTime:   int(utils.NanosToSeconds(stop.ArrivalTime)),
-						DepartureTime: int(utils.NanosToSeconds(stop.DepartureTime)),
-						DropOffType:   int(stop.DropOffType.Int64),
-						PickupType:    int(stop.PickupType.Int64),
-						StopID:        utils.FormCombinedID(agencyID, stop.StopID),
+					StopTime: models.BlockStopTimeData{
+						StopTime: models.StopTime{
+							ArrivalTime:   models.NewModelDuration(time.Duration(stop.ArrivalTime)),
+							DepartureTime: models.NewModelDuration(time.Duration(stop.DepartureTime)),
+							StopID:        utils.FormCombinedID(agencyID, stop.StopID),
+						},
+						DropOffType: int(stop.DropOffType.Int64),
+						PickupType:  int(stop.PickupType.Int64),
 					},
 				}
 				blockStopTimes = append(blockStopTimes, blockStopTime)
@@ -139,15 +139,15 @@ func transformBlockToEntry(block []gtfsdb.GetBlockDetailsRow, blockID, agencyID 
 
 			blockStopTimes = calculateBlockSlackTimes(blockStopTimes)
 
-			var tripAccumulatedSlack float64
+			var tripAccumulatedSlack time.Duration
 			if len(blockStopTimes) > 0 {
-				tripAccumulatedSlack = blockStopTimes[len(blockStopTimes)-1].AccumulatedSlackTime
+				tripAccumulatedSlack = blockStopTimes[len(blockStopTimes)-1].AccumulatedSlackTime.Duration
 			}
 
 			tripDistance := blockDistance - tripStartDistance
 
 			trip := models.TripBlock{
-				AccumulatedSlackTime: int(tripAccumulatedSlack),
+				AccumulatedSlackTime: models.NewModelDuration(tripAccumulatedSlack),
 				BlockStopTimes:       blockStopTimes,
 				DistanceAlongBlock:   tripDistance,
 				TripId:               utils.FormCombinedID(agencyID, tripID),
@@ -164,18 +164,18 @@ func transformBlockToEntry(block []gtfsdb.GetBlockDetailsRow, blockID, agencyID 
 	}
 }
 
-// IMPORTANT: Caller must hold manager.RLock() before calling this method.
 func (api *RestAPI) getReferences(ctx context.Context, agencyID string, block []gtfsdb.GetBlockDetailsRow) (models.ReferencesModel, error) {
 	routeIDs := make(map[string]struct{})
 	stopIDs := make(map[string]struct{})
 	tripIDs := make(map[string]struct{})
 
-	stopIDsArr := make([]string, 0, len(stopIDs))
 	for _, row := range block {
 		routeIDs[row.RouteID] = struct{}{}
 		stopIDs[row.StopID] = struct{}{}
 		tripIDs[row.TripID] = struct{}{}
 	}
+
+	stopIDsArr := make([]string, 0, len(stopIDs))
 	for stopID := range stopIDs {
 		stopIDsArr = append(stopIDsArr, stopID)
 	}
@@ -190,7 +190,7 @@ func (api *RestAPI) getReferences(ctx context.Context, agencyID string, block []
 		return models.ReferencesModel{}, err
 	}
 	routeSet := make(map[string]struct{})
-	var routes []interface{}
+	routes := make([]models.Route, 0)
 	for _, route := range routesArr {
 		routeID := utils.FormCombinedID(agencyID, route.ID)
 		if _, exists := routeSet[routeID]; exists {
@@ -209,72 +209,64 @@ func (api *RestAPI) getReferences(ctx context.Context, agencyID string, block []
 		})
 	}
 
-	var stops []models.Stop
-	for stopID := range stopIDs {
-		if ctx.Err() != nil {
-			return models.ReferencesModel{}, ctx.Err()
-		}
+	// batch fetch
+	batchedStops, err := api.GtfsManager.GtfsDB.Queries.GetStopsByIDs(ctx, stopIDsArr)
+	if err != nil {
+		return models.ReferencesModel{}, err
+	}
 
-		stop, err := api.GtfsManager.GtfsDB.Queries.GetStop(ctx, stopID)
-		if err != nil {
-			return models.ReferencesModel{}, err
-		}
+	stops := make([]models.Stop, 0)
+	for _, stop := range batchedStops {
 		stops = append(stops, models.Stop{
-			ID:        utils.FormCombinedID(agencyID, stop.ID),
-			Name:      stop.Name.String,
-			Code:      stop.Code.String,
-			Lat:       stop.Lat,
-			Lon:       stop.Lon,
-			Direction: api.DirectionCalculator.CalculateStopDirection(ctx, stop.ID, stop.Direction),
+			ID:             utils.FormCombinedID(agencyID, stop.ID),
+			Name:           stop.Name.String,
+			Code:           stop.Code.String,
+			Lat:            stop.Lat,
+			Lon:            stop.Lon,
+			Direction:      api.DirectionCalculator.CalculateStopDirection(ctx, stop.ID, stop.Direction),
+			RouteIDs:       []string{},
+			StaticRouteIDs: []string{},
 		})
 	}
 
-	var trips []interface{}
-	for tripID := range tripIDs {
-		if ctx.Err() != nil {
-			return models.ReferencesModel{}, ctx.Err()
-		}
+	// batch fetch
+	tripIDsArr := make([]string, 0, len(tripIDs))
+	for tid := range tripIDs {
+		tripIDsArr = append(tripIDsArr, tid)
+	}
 
-		trip, err := api.GtfsManager.GtfsDB.Queries.GetTrip(ctx, tripID)
-		if err != nil {
-			return models.ReferencesModel{}, err
-		}
+	batchedTrips, err := api.GtfsManager.GtfsDB.Queries.GetTripsByIDs(ctx, tripIDsArr)
+	if err != nil {
+		return models.ReferencesModel{}, err
+	}
+
+	trips := make([]models.Trip, 0)
+	for _, trip := range batchedTrips {
 		trips = append(trips, models.Trip{
 			ID:           utils.FormCombinedID(agencyID, trip.ID),
 			RouteID:      utils.FormCombinedID(agencyID, trip.RouteID),
 			ServiceID:    utils.FormCombinedID(agencyID, trip.ServiceID),
-			DirectionID:  trip.DirectionID.Int64,
+			DirectionID:  strconv.FormatInt(trip.DirectionID.Int64, 10),
 			BlockID:      utils.FormCombinedID(agencyID, trip.BlockID.String),
 			ShapeID:      utils.FormCombinedID(agencyID, trip.ShapeID.String),
 			TripHeadsign: trip.TripHeadsign.String,
 		})
 	}
 
-	if stops == nil {
-		stops = []models.Stop{}
-	}
-	if routes == nil {
-		routes = []interface{}{}
-	}
-	if trips == nil {
-		trips = []interface{}{}
-	}
-	return models.ReferencesModel{
-		Agencies:   []models.AgencyReference{{ID: agency.ID, Name: agency.Name, URL: agency.Url, Timezone: agency.Timezone}},
-		Routes:     routes,
-		Stops:      stops,
-		Trips:      trips,
-		StopTimes:  []interface{}{},
-		Situations: []interface{}{},
-	}, nil
+	references := models.NewEmptyReferences()
+	references.Agencies = []models.AgencyReference{{ID: agency.ID, Name: agency.Name, URL: agency.Url, Timezone: agency.Timezone}}
+	references.Routes = routes
+	references.Stops = stops
+	references.Trips = trips
+	return *references, nil
 }
 
 func calculateBlockSlackTimes(blockStopTimes []models.BlockStopTime) []models.BlockStopTime {
-	var accumulatedBlockSlackTime int
+	var accumulatedBlockSlackTime time.Duration
 
 	for i := range blockStopTimes {
-		blockStopTimes[i].AccumulatedSlackTime = float64(accumulatedBlockSlackTime)
-		dwellTime := blockStopTimes[i].StopTime.DepartureTime - blockStopTimes[i].StopTime.ArrivalTime
+		blockStopTimes[i].AccumulatedSlackTime = models.NewModelDuration(accumulatedBlockSlackTime)
+		dwellTime := blockStopTimes[i].StopTime.DepartureTime.Duration - blockStopTimes[i].StopTime.ArrivalTime.Duration
 		accumulatedBlockSlackTime += dwellTime
 	}
 

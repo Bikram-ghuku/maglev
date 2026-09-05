@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCacheControlHeaders(t *testing.T) {
@@ -55,6 +56,41 @@ func TestCacheControlHeaders(t *testing.T) {
 	}
 }
 
+// TestRealtimeEndpointsAreNotCachedAsStatic guards the endpoints that put real-time
+// service alerts in references.situations. The ETag is the static feed's file hash, so
+// serving one alongside alert data hands clients a 304 for as long as the feed is
+// unchanged, however often the alerts move.
+func TestRealtimeEndpointsAreNotCachedAsStatic(t *testing.T) {
+	api := createTestApi(t)
+
+	mux := http.NewServeMux()
+	api.SetRoutes(mux)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	endpoints := []struct {
+		name     string
+		endpoint string
+	}{
+		{"search stop", "/api/where/search/stop.json?input=Buenaventura&key=TEST"},
+		{"search route", "/api/where/search/route.json?input=Route&key=TEST"},
+		{"route", "/api/where/route/25_151.json?key=TEST"},
+	}
+
+	for _, tt := range endpoints {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, err := http.Get(server.URL + tt.endpoint)
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+
+			assert.Empty(t, resp.Header.Get("ETag"),
+				"%s carries real-time alerts and must not be validated against the static feed hash", tt.endpoint)
+			assert.Equal(t, "public, max-age=30", resp.Header.Get("Cache-Control"),
+				"%s carries real-time alerts and must not be cached as static", tt.endpoint)
+		})
+	}
+}
+
 // TestCacheControlWriter_304PreservesCache proves the bug fix works
 func TestCacheControlWriter_304PreservesCache(t *testing.T) {
 	// Dummy handler that just returns 304 Not Modified
@@ -78,7 +114,7 @@ func TestCacheControlWriter_304PreservesCache(t *testing.T) {
 // TestETagMiddleware proves the conditional request logic works
 func TestETagMiddleware(t *testing.T) {
 	mockETag := `"test-hash-123"`
-	getETag := func() string { return mockETag }
+	getETag := func(_ *http.Request) string { return mockETag }
 
 	handlerCalled := false
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +184,7 @@ func TestETagMiddleware(t *testing.T) {
 
 	t.Run("Empty ETag from system gracefully falls back", func(t *testing.T) {
 		handlerCalled = false
-		emptyETagWrapped := ETagMiddleware(func() string { return "" })(handler)
+		emptyETagWrapped := ETagMiddleware(func(_ *http.Request) string { return "" })(handler)
 
 		req := httptest.NewRequest("GET", "/", nil)
 		rr := httptest.NewRecorder()

@@ -1,12 +1,15 @@
 package webui
 
 import (
+	"context"
 	"embed"
-	"html/template"
+	"encoding/json"
+	"fmt"
+	"html"
+	"io"
 	"log/slog"
 	"net/http"
 
-	"github.com/davecgh/go-spew/spew"
 	"maglev.onebusaway.org/internal/appconf"
 )
 
@@ -18,27 +21,29 @@ type debugData struct {
 	Pre   string
 }
 
-func writeDebugData(w http.ResponseWriter, title string, data interface{}) {
-	content := spew.Sdump(data)
-	w.Header().Set("Content-Type", "text/html")
-	tmpl, err := template.ParseFS(templateFS, "debug_index.html")
-	if err != nil {
-		// Log the actual error server-side
-		slog.Error("failed to parse debug template", "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+func writeDebugData(w http.ResponseWriter, title string, data any) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	fmt.Fprintf(w, "<!doctype html><html><head><meta charset=\"utf-8\"><title>%s</title></head><body>", html.EscapeString(title))
+	fmt.Fprintf(w, "<h1>%s</h1><pre>", html.EscapeString(title))
+
+	if data == nil {
+		io.WriteString(w, "nil")
+	} else {
+		switch v := data.(type) {
+		case string:
+			fmt.Fprint(w, html.EscapeString(v))
+		default:
+			if b, err := json.MarshalIndent(v, "", "  "); err == nil {
+				fmt.Fprint(w, html.EscapeString(string(b)))
+			} else {
+				fmt.Fprint(w, html.EscapeString(fmt.Sprint(v)))
+			}
+		}
 	}
 
-	dataStruct := debugData{
-		Title: title,
-		Pre:   content,
-	}
-
-	err = tmpl.Execute(w, dataStruct)
-	if err != nil {
-		slog.Error("failed to execute debug template", "error", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-	}
+	io.WriteString(w, "</pre></body></html>")
 }
 
 func (webUI *WebUI) debugIndexHandler(w http.ResponseWriter, r *http.Request) {
@@ -47,40 +52,38 @@ func (webUI *WebUI) debugIndexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dataType := r.URL.Query().Get("dataType")
+	ctx := context.Background()
+	queries := webUI.GtfsManager.GtfsDB.Queries
 
-	var data interface{}
+	var data any
 	var title string
 
-	webUI.GtfsManager.RLock()
-	defer webUI.GtfsManager.RUnlock()
-
-	staticData := webUI.GtfsManager.GetStaticData()
-
+	var err error
 	switch dataType {
-	case "warnings":
-		data = staticData.Warnings
-		title = "GTFS Static - Parse Warnings"
 	case "agencies":
-		data = staticData.Agencies
+		data, err = queries.ListAgencies(ctx)
+		if err != nil {
+			slog.Error("debug: failed to list agencies", "error", err)
+		}
 		title = "GTFS Static - Agencies"
 	case "routes":
-		data = staticData.Routes
+		data, err = queries.ListRoutes(ctx)
+		if err != nil {
+			slog.Error("debug: failed to list routes", "error", err)
+		}
 		title = "GTFS Static - Routes"
 	case "stops":
-		data = staticData.Stops
+		data, err = queries.ListStops(ctx)
+		if err != nil {
+			slog.Error("debug: failed to list stops", "error", err)
+		}
 		title = "GTFS Static - Stops"
-	case "transfers":
-		data = staticData.Transfers
-		title = "GTFS Static - Transfers"
-	case "services":
-		data = staticData.Services
-		title = "GTFS Static - Services"
 	case "trips":
-		data = staticData.Trips
+		data, err = queries.ListTrips(ctx)
+		if err != nil {
+			slog.Error("debug: failed to list trips", "error", err)
+		}
 		title = "GTFS Static - Trips"
-	case "shapes":
-		data = staticData.Shapes
-		title = "GTFS Static - Shapes"
 	case "realtime_trips":
 		data = webUI.GtfsManager.GetRealTimeTrips()
 		title = "GTFS Realtime - Trips"
@@ -89,7 +92,7 @@ func (webUI *WebUI) debugIndexHandler(w http.ResponseWriter, r *http.Request) {
 		title = "GTFS Realtime - Vehicles"
 	default:
 		data = map[string]string{
-			"error": "Please use one of the following: warnings, agencies, routes, stops, transfers, services, trips, shapes, realtime_trips, realtime_vehicles.",
+			"error": "Please use one of the following: agencies, routes, stops, trips, realtime_trips, realtime_vehicles.",
 		}
 		title = "Choose a data type"
 	}

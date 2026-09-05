@@ -20,7 +20,7 @@ type GtfsStaticFeed struct {
 // GtfsRtFeed represents a single GTFS-RT feed configuration
 type GtfsRtFeed struct {
 	ID                      string            `json:"id"`
-	AgencyIDs               []string          `json:"agency-ids"` // Reserved for future use - not currently used for filtering
+	AgencyIDs               []string          `json:"agency-ids"` // When set, only realtime data for these agencies is included
 	TripUpdatesURL          string            `json:"trip-updates-url"`
 	VehiclePositionsURL     string            `json:"vehicle-positions-url"`
 	ServiceAlertsURL        string            `json:"service-alerts-url"`
@@ -34,6 +34,7 @@ type GtfsRtFeed struct {
 // JSONConfig represents the JSON configuration file structure
 type JSONConfig struct {
 	Port             int            `json:"port"`
+	Host             string         `json:"host"`
 	Env              string         `json:"env"`
 	ApiKeys          []string       `json:"api-keys"`
 	ProtectedApiKeys []string       `json:"protected-api-keys"`
@@ -42,6 +43,10 @@ type JSONConfig struct {
 	GtfsStaticFeed   GtfsStaticFeed `json:"gtfs-static-feed"`
 	GtfsRtFeeds      []GtfsRtFeed   `json:"gtfs-rt-feeds"`
 	DataPath         string         `json:"data-path"`
+	LogLevel         string         `json:"log-level"`
+	LogFormat        string         `json:"log-format"`
+	TLSCertPath      string         `json:"tls-cert-path"`
+	TLSKeyPath       string         `json:"tls-key-path"`
 }
 
 // setDefaults applies default values to the JSON config if fields are missing or zero
@@ -77,6 +82,12 @@ func (j *JSONConfig) setDefaults() {
 	}
 	if j.DataPath == "" {
 		j.DataPath = "./gtfs.db"
+	}
+	if j.LogLevel == "" {
+		j.LogLevel = "info"
+	}
+	if j.LogFormat == "" {
+		j.LogFormat = "text"
 	}
 }
 
@@ -131,8 +142,37 @@ func (j *JSONConfig) Validate() error {
 		seenProtected[key] = true
 	}
 
+	validLogLevels := map[string]bool{
+		"debug": true,
+		"info":  true,
+		"warn":  true,
+		"error": true,
+	}
+	if !validLogLevels[j.LogLevel] {
+		return fmt.Errorf("log level must be one of [debug, info, warn, error], got %q", j.LogLevel)
+	}
+
+	validLogFormats := map[string]bool{
+		"text": true,
+		"json": true,
+	}
+	if !validLogFormats[j.LogFormat] {
+		return fmt.Errorf("log format must be one of [text, json], got %q", j.LogFormat)
+	}
+
 	// Validate DataPath for path traversal attempts
 	if err := validatePath(j.DataPath, "data-path"); err != nil {
+		return err
+	}
+
+	// TLS: both cert and key must be provided together
+	if (j.TLSCertPath != "" && j.TLSKeyPath == "") || (j.TLSCertPath == "" && j.TLSKeyPath != "") {
+		return fmt.Errorf("both tls-cert-path and tls-key-path must be provided together")
+	}
+	if err := validatePath(j.TLSCertPath, "tls-cert-path"); err != nil {
+		return err
+	}
+	if err := validatePath(j.TLSKeyPath, "tls-key-path"); err != nil {
 		return err
 	}
 
@@ -196,19 +236,23 @@ func validatePath(path, fieldName string) error {
 func (j *JSONConfig) ToAppConfig() Config {
 	return Config{
 		Port:             j.Port,
+		Host:             j.Host,
 		Env:              EnvFlagToEnvironment(j.Env),
 		ApiKeys:          j.ApiKeys,
 		ProtectedApiKeys: j.ProtectedApiKeys,
 		ExemptApiKeys:    j.ExemptApiKeys,
-		Verbose:          true, // Always set to true like in main.go
 		RateLimit:        j.RateLimit,
+		LogLevel:         j.LogLevel,
+		LogFormat:        j.LogFormat,
+		TLSCertPath:      j.TLSCertPath,
+		TLSKeyPath:       j.TLSKeyPath,
 	}
 }
 
 // RTFeedConfigData holds per-feed GTFS-RT configuration
 type RTFeedConfigData struct {
-	ID                  string   // Note it's will be generated if missing
-	AgencyIDs           []string // Reserved for future use - not currently used for filtering
+	ID                  string   // Note it will be generated if missing
+	AgencyIDs           []string // When set, only realtime data for these agencies is included
 	TripUpdatesURL      string
 	VehiclePositionsURL string
 	ServiceAlertsURL    string
@@ -226,7 +270,6 @@ type GtfsConfigData struct {
 	RTFeeds               []RTFeedConfigData
 	GTFSDataPath          string
 	Env                   Environment
-	Verbose               bool
 	EnableGTFSTidy        bool
 }
 
@@ -238,9 +281,10 @@ func (j *JSONConfig) ToGtfsConfigData() (GtfsConfigData, error) {
 		StaticAuthHeaderValue: j.GtfsStaticFeed.AuthHeaderValue,
 		GTFSDataPath:          j.DataPath,
 		Env:                   EnvFlagToEnvironment(j.Env),
-		Verbose:               true, // Always set to true like in main.go
 		EnableGTFSTidy:        j.GtfsStaticFeed.EnableGTFSTidy,
 	}
+
+	seen := make(map[string]struct{})
 
 	for i, feed := range j.GtfsRtFeeds {
 		feedID := feed.ID
@@ -248,13 +292,12 @@ func (j *JSONConfig) ToGtfsConfigData() (GtfsConfigData, error) {
 			feedID = fmt.Sprintf("feed-%d", i)
 		}
 
-		for _, existingID := range cfg.RTFeeds {
-			if existingID.ID == feedID {
-				return GtfsConfigData{}, fmt.Errorf("duplicate feed ID found: %q", feedID)
-			}
+		if _, exists := seen[feedID]; exists {
+			return GtfsConfigData{}, fmt.Errorf("duplicate feed ID found: %q", feedID)
 		}
+		seen[feedID] = struct{}{}
 
-		headers := make(map[string]string)
+		headers := make(map[string]string, len(feed.Headers))
 		for k, v := range feed.Headers {
 			headers[k] = v
 		}
@@ -351,6 +394,14 @@ func LoadFromFile(path string) (*JSONConfig, error) {
 		}
 	}
 
+	// Override logging level and format
+	if logLevel := strings.TrimSpace(os.Getenv("MAGLEV_LOG_LEVEL")); logLevel != "" {
+		config.LogLevel = strings.ToLower(logLevel)
+	}
+	if logFormat := strings.TrimSpace(os.Getenv("MAGLEV_LOG_FORMAT")); logFormat != "" {
+		config.LogFormat = strings.ToLower(logFormat)
+	}
+
 	// Override Protected API Keys
 	if envProtectedKeys := os.Getenv("GTFS_PROTECTED_API_KEYS"); envProtectedKeys != "" {
 		rawKeys := strings.Split(envProtectedKeys, ",")
@@ -401,7 +452,9 @@ func LoadFromFile(path string) (*JSONConfig, error) {
 		"port", config.Port,
 		"env", config.Env,
 		"api_keys_count", len(config.ApiKeys),
-		"rate_limit", config.RateLimit)
+		"rate_limit", config.RateLimit,
+		"log_level", config.LogLevel,
+		"log_format", config.LogFormat)
 
 	return &config, nil
 }
